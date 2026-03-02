@@ -19,21 +19,23 @@ Responsibilities
    not yet been confirmed uploaded), post a Teams message to the owner asking
    for their expected upload date.
 
-Usage (standalone)
-------------------
+Usage (standalone — must be called from an async context)
+----------------------------------------------------------
+    import asyncio
     from modules.eta_checker import ETAChecker
     checker = ETAChecker(llm=my_llm_instance, notifier=teams_notifier)
 
     # Parse a single fuzzy string
-    result = checker.parse_eta("Mar.3")
+    result = await checker.parse_eta("Mar.3")
     # → ETAResult(raw="Mar.3", parsed=date(2026, 3, 3), corrected=False, ...)
 
-    # Process all records — parse ETAs and nudge blank ones
-    report = checker.check_records(records, splunk_data)
+    # Process all records concurrently — parse ETAs and nudge blank ones
+    report = await checker.check_records(records, splunk_data)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -125,18 +127,18 @@ class ETAChecker:
     # Public API
     # ----------------------------------------------------------
 
-    def parse_eta(self, raw: str) -> ETAResult:
+    async def parse_eta(self, raw: str) -> ETAResult:
         """
-        Parse a single ETA cell value.
+        Parse a single ETA cell value.  **Must be awaited.**
 
         Resolution order
         ----------------
-        1. Blank → ETAResult(is_blank=True)
-        2. "done" / "v" → ETAResult(is_done=True)
-        3. "n/a" / "x"  → ETAResult(is_na=True)
-        4. Regex fast-path for common date formats
-        5. LLM fallback for anything the regex cannot handle
-        6. Year-flip correction on the resulting date
+        1. Blank  → ETAResult(is_blank=True)           — no I/O
+        2. "done" / "v" → ETAResult(is_done=True)      — no I/O
+        3. "n/a" / "x"  → ETAResult(is_na=True)        — no I/O
+        4. Regex fast-path for common date formats      — no I/O
+        5. LLM fallback (async, non-blocking)           — awaits Azure
+        6. Year-flip correction on the resulting date   — no I/O
         """
         if not raw or not raw.strip():
             return ETAResult(raw=raw, parsed=None, is_blank=True)
@@ -149,13 +151,13 @@ class ETAChecker:
         if _NA_RE.match(cleaned):
             return ETAResult(raw=raw, parsed=None, is_na=True)
 
-        # --- Regex fast-path ---
+        # --- Regex fast-path (synchronous, no await) ---
         parsed, err = self._regex_parse(cleaned)
 
-        # --- LLM fallback ---
+        # --- LLM fallback (async, non-blocking) ---
         llm_used = False
         if parsed is None and self._llm is not None:
-            parsed, err, llm_used = self._llm_parse(raw, cleaned)
+            parsed, err, llm_used = await self._llm_parse(raw, cleaned)
 
         if parsed is None:
             return ETAResult(
@@ -164,7 +166,7 @@ class ETAChecker:
                 llm_used=llm_used,
             )
 
-        # --- Year-flip correction ---
+        # --- Year-flip correction (synchronous) ---
         parsed, corrected = self._correct_year_flip(parsed, raw)
 
         return ETAResult(
@@ -173,7 +175,7 @@ class ETAChecker:
             llm_used=llm_used,
         )
 
-    def check_records(
+    async def check_records(
         self,
         records,            # list[SubsysRecord]
         splunk_data: dict,  # {subsys: {"netlist": bool|None, ...}}
@@ -182,7 +184,12 @@ class ETAChecker:
     ) -> list[dict]:
         """
         Iterate over all records, parse ETA fields, and optionally send Teams
-        nudges for blank ETA fields.
+        nudges for blank ETA fields.  **Must be awaited.**
+
+        All ``ppt_status`` LLM parse calls are launched **concurrently** via
+        ``asyncio.gather`` — the event loop is free to handle other work while
+        waiting for Azure responses, and N module queries finish in roughly the
+        time of the slowest single query rather than N × that time.
 
         Parameters
         ----------
@@ -204,75 +211,98 @@ class ETAChecker:
             (blank, needs correction, or couldn't be parsed).
         """
         report = []
+
+        # ── Step 1: handle non-ppt upload-flag fields synchronously ──────────
+        #   These never need LLM calls — process them up-front.
         for rec in records:
             sp = splunk_data.get(rec.subsys, {})
-
             for fld in fields:
+                if fld == "ppt_status":
+                    continue  # handled below
                 raw_val = getattr(rec, fld, "") or ""
-
-                # For netlist/sdc/ccf/upf: only ETA-like strings are interesting
-                if fld != "ppt_status":
-                    uploaded = (
-                        raw_val.lower() in ("v", "done", "x")
-                        or sp.get(fld) is True
-                    )
-                    if uploaded:
-                        continue      # already done — skip
-                    if not raw_val or raw_val.strip() == "":
-                        # Blank upload field — nudge if requested
-                        if nudge_blank and self._notifier:
-                            self._send_blank_nudge(rec, fld)
-                        report.append({
-                            "subsys": rec.subsys,
-                            "field":  fld,
-                            "status": "blank",
-                            "owner":  rec.be,
-                        })
-                    continue   # no ETA to parse for these fields
-
-                # ppt_status: full ETA parsing
-                result = self.parse_eta(raw_val)
-                entry  = {
-                    "subsys":    rec.subsys,
-                    "field":     fld,
-                    "raw":       raw_val,
-                    "owner":     rec.be,
-                    "eta_result": result,
-                }
-
-                if result.is_done or result.is_na:
-                    continue   # nothing to flag
-
-                if result.is_blank:
+                uploaded = (
+                    raw_val.lower() in ("v", "done", "x")
+                    or sp.get(fld) is True
+                )
+                if uploaded:
+                    continue
+                if not raw_val or raw_val.strip() == "":
                     if nudge_blank and self._notifier:
                         self._send_blank_nudge(rec, fld)
-                    entry["status"] = "blank"
-                    report.append(entry)
-                    continue
+                    report.append({
+                        "subsys": rec.subsys,
+                        "field":  fld,
+                        "status": "blank",
+                        "owner":  rec.be,
+                    })
 
-                if result.parse_error:
-                    logger.warning(
-                        f"[ETAChecker] Could not parse ETA for "
-                        f"{rec.subsys}/{fld}: {raw_val!r} → {result.parse_error}"
-                    )
-                    entry["status"] = "parse_error"
-                    report.append(entry)
-                    continue
+        # ── Step 2: fan out ALL ppt_status parse_eta calls concurrently ──────
+        #   Build the task list first, keeping track of which record each
+        #   task belongs to, then gather them all in one shot.
+        if "ppt_status" not in fields:
+            return report
 
-                if result.corrected:
-                    logger.warning(
-                        f"[ETAChecker] Year-flip correction applied for "
-                        f"{rec.subsys}/{fld}: {raw_val!r} → {result.iso}"
-                    )
-                    entry["status"] = "year_corrected"
-                    report.append(entry)
+        ppt_records = [
+            (rec, getattr(rec, "ppt_status", "") or "")
+            for rec in records
+        ]
 
-                # Log upcoming / overdue ETAs regardless
-                if result.days_until is not None and result.days_until < 0:
-                    logger.warning(
-                        f"[ETAChecker] OVERDUE ETA: {rec.subsys}/{fld} "
-                        f"was {result.iso} ({abs(result.days_until)}d ago)"
-                    )
+        # asyncio.gather fires all coroutines; return_exceptions prevents one
+        # failed LLM call from aborting the rest.
+        eta_results: list[ETAResult | BaseException] = await asyncio.gather(
+            *[self.parse_eta(raw) for _, raw in ppt_records],
+            return_exceptions=True,
+        )
+
+        # ── Step 3: process gathered results ─────────────────────────────────
+        for (rec, raw_val), result in zip(ppt_records, eta_results):
+            # Wrap unexpected exceptions in a failed ETAResult
+            if isinstance(result, BaseException):
+                result = ETAResult(
+                    raw=raw_val, parsed=None,
+                    parse_error=f"Unhandled exception: {result}",
+                )
+
+            entry = {
+                "subsys":     rec.subsys,
+                "field":      "ppt_status",
+                "raw":        raw_val,
+                "owner":      rec.be,
+                "eta_result": result,
+            }
+
+            if result.is_done or result.is_na:
+                continue
+
+            if result.is_blank:
+                if nudge_blank and self._notifier:
+                    self._send_blank_nudge(rec, "ppt_status")
+                entry["status"] = "blank"
+                report.append(entry)
+                continue
+
+            if result.parse_error:
+                logger.warning(
+                    f"[ETAChecker] Could not parse ETA for "
+                    f"{rec.subsys}/ppt_status: {raw_val!r} → {result.parse_error}"
+                )
+                entry["status"] = "parse_error"
+                report.append(entry)
+                continue
+
+            if result.corrected:
+                logger.warning(
+                    f"[ETAChecker] Year-flip correction applied for "
+                    f"{rec.subsys}/ppt_status: {raw_val!r} → {result.iso}"
+                )
+                entry["status"] = "year_corrected"
+                report.append(entry)
+
+            if result.days_until is not None and result.days_until < 0:
+                logger.warning(
+                    f"[ETAChecker] OVERDUE ETA: {rec.subsys}/ppt_status "
+                    f"was {result.iso} ({abs(result.days_until)}d ago)"
+                )
 
         return report
 
@@ -319,11 +349,14 @@ class ETAChecker:
 
         return None, "No regex pattern matched"
 
-    def _llm_parse(
+    async def _llm_parse(
         self, raw: str, cleaned: str
     ) -> tuple[Optional[date], str, bool]:
         """
-        Ask the LLM to normalise the date string.
+        Ask the LLM to normalise the date string.  **Must be awaited.**
+
+        Calls ``self._llm.simple_query`` which is itself an async coroutine,
+        so the event loop is free while waiting for Azure's response.
 
         Returns (date | None, error_msg, llm_used=True).
         """
@@ -344,8 +377,8 @@ Your task:
 Do NOT include any explanation outside the JSON object."""
 
         try:
-            raw_reply = self._llm.simple_query(prompt)
-            # Extract the JSON object from the reply (LLM may add markdown fences)
+            raw_reply = await self._llm.simple_query(prompt)   # ← non-blocking await
+            # Extract the JSON object from the reply (LLM may wrap in markdown fences)
             json_match = re.search(r"\{.*?\}", raw_reply, re.DOTALL)
             if not json_match:
                 return None, f"LLM returned no JSON: {raw_reply[:120]}", True

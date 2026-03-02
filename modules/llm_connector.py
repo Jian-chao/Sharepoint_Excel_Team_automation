@@ -3,8 +3,12 @@ modules/llm_connector.py
 ========================
 LangChain-based Azure OpenAI GPT-4o connector.
 
-Provides ``LLM_cls`` with a ``simple_query(prompt) -> str`` method used by
-``ETAChecker`` (and any other module that needs LLM access).
+Provides ``LLM_cls`` with an **async** ``simple_query(prompt) -> str`` method
+used by ``ETAChecker`` (and any other module that needs LLM access).
+
+Because ``simple_query`` is a coroutine, callers must ``await`` it::
+
+    reply = await llm.simple_query("What date is 'Mar.3' in 2026?")
 
 Configuration
 -------------
@@ -19,7 +23,7 @@ Usage
 -----
     from modules.llm_connector import LLM_cls
     llm   = LLM_cls()
-    reply = llm.simple_query("What date is 'Mar.3' in 2026?")
+    reply = await llm.simple_query("What date is 'Mar.3' in 2026?")
 """
 
 import logging
@@ -71,9 +75,13 @@ class LLM_cls:
         )
 
     # ----------------------------------------------------------
-    def simple_query(self, prompt: str) -> str:
+    async def simple_query(self, prompt: str) -> str:
         """
-        Send a single-turn prompt and return the model's reply as a string.
+        Send a single-turn prompt **asynchronously** and return the model's
+        reply as a string.  The caller must ``await`` this coroutine.
+
+        Uses ``AzureChatOpenAI.ainvoke`` so the asyncio event loop is
+        **never blocked** while waiting for the Azure OpenAI response.
 
         Parameters
         ----------
@@ -88,8 +96,12 @@ class LLM_cls:
         from langchain_core.messages import HumanMessage
 
         logger.debug(f"[LLM] simple_query prompt ({len(prompt)} chars)")
-        messages  = [HumanMessage(content=prompt)]
-        response  = self._llm.invoke(messages)
-        reply     = response.content
-        logger.debug(f"[LLM] simple_query reply: {reply[:120]!r}{'...' if len(reply)>120 else ''}")
+        messages = [HumanMessage(content=prompt)]
+        # ainvoke returns a coroutine — await it without blocking the loop
+        response = await self._llm.ainvoke(messages)
+        reply    = response.content
+        logger.debug(
+            f"[LLM] simple_query reply: {reply[:120]!r}"
+            f"{'...' if len(reply) > 120 else ''}"
+        )
         return reply
