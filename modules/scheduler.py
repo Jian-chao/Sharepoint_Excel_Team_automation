@@ -99,14 +99,23 @@ class AutomationScheduler:
 
     # ----------------------------------------------------------
     def _fetch_data(self):
-        """Shared data fetch used by all jobs."""
+        """Shared data fetch used by all jobs.
+
+        ``splunk.query()`` is called **exactly once** per job run.
+        The returned DataFrame is processed in bulk via
+        ``get_all_statuses()`` so no extra Splunk round-trips occur.
+        """
         excel_bytes = self.sp.download_excel()
         reader      = ExcelReader(excel_bytes)
         records     = reader.get_all_records(include_skipped=False)
 
+        # Single Splunk query for all modules
         splunk_df   = self.splunk.query()
+        all_statuses = self.splunk.get_all_statuses(splunk_df)
+
+        # Build per-subsys map; fall back to empty dict if module not in Splunk
         splunk_data = {
-            rec.subsys: self.splunk.get_latest_status(rec.subsys)
+            rec.subsys: all_statuses.get(rec.subsys.lower(), {col: None for col in ["netlist", "sdc", "ccf", "upf"]})
             for rec in records
         }
         return records, splunk_data

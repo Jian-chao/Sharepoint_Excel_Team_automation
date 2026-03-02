@@ -53,11 +53,11 @@ def get_connector():
 _DELIVERABLE_COLS = ["netlist", "sdc", "ccf", "upf"]
 
 class _BaseConnector:
-    def get_latest_status(self, module_name: str) -> dict:
+    @staticmethod
+    def _status_from_df_mod(df_mod: pd.DataFrame, module_name: str) -> dict:
         """
-        Filter the Splunk CSV data for a specific MODULE name,
-        pick the row(s) with the latest Timestamp, and return
-        upload status for each deliverable.
+        Given a DataFrame already filtered to a single MODULE, return
+        the upload-status dict for each deliverable column.
 
         Returns
         -------
@@ -66,29 +66,71 @@ class _BaseConnector:
               False → Viol == 0 (not uploaded yet)
               None  → no Splunk data found for this module
         """
-        df = self.query()
-        if df.empty:
-            return {col: None for col in _DELIVERABLE_COLS}
-
-        df_mod = df[df["MODULE"].str.lower() == module_name.lower()].copy()
         if df_mod.empty:
             logger.warning(f"[Splunk] No data found for MODULE={module_name!r}")
             return {col: None for col in _DELIVERABLE_COLS}
 
-        # Always use the latest timestamp
-        df_mod["Timestamp"] = pd.to_numeric(df_mod["Timestamp"], errors="coerce")
-        latest_ts = df_mod["Timestamp"].max()
-        df_latest = df_mod[df_mod["Timestamp"] == latest_ts]
-
         result = {}
         for col in _DELIVERABLE_COLS:
-            rows = df_latest[df_latest["SUB_GROUP"].str.lower() == col.lower()]
+            rows = df_mod[df_mod["SUB_GROUP"].str.lower() == col.lower()]
             if rows.empty:
                 result[col] = None
             else:
                 viol_val = rows["Viol"].iloc[0]
                 result[col] = int(viol_val) == 1
         return result
+
+    def get_latest_status(self, module_name: str, df: pd.DataFrame | None = None) -> dict:
+        """
+        Return upload status for each deliverable of *module_name*.
+
+        Parameters
+        ----------
+        module_name : str
+            The MODULE value to look up.
+        df : pd.DataFrame, optional
+            A pre-fetched Splunk DataFrame.  When provided, ``query()`` is
+            **not** called again — pass this to avoid extra network round-trips.
+            When omitted, ``query()`` is called once internally (legacy use).
+
+        Returns
+        -------
+        dict  e.g. {"netlist": True, "sdc": False, "ccf": True, "upf": True}
+        """
+        if df is None:
+            df = self.query()
+        if df.empty:
+            return {col: None for col in _DELIVERABLE_COLS}
+
+        df_mod = df[df["MODULE"].str.lower() == module_name.lower()]
+        return self._status_from_df_mod(df_mod, module_name)
+
+    def get_all_statuses(self, df: pd.DataFrame) -> dict[str, dict]:
+        """
+        Build a **{module_name → status_dict}** mapping for every MODULE
+        present in *df* in a single pass — no extra ``query()`` calls.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The already-fetched Splunk DataFrame (call ``query()`` once and
+            pass the result here).
+
+        Returns
+        -------
+        dict[str, dict]
+            Keys are lowercased MODULE names; values are the same dicts
+            returned by ``get_latest_status``.
+        """
+        if df.empty:
+            return {}
+
+        all_statuses: dict[str, dict] = {}
+        df_lower = df.copy()
+        df_lower["_mod_lower"] = df_lower["MODULE"].str.lower()
+        for module_lower, df_mod in df_lower.groupby("_mod_lower"):
+            all_statuses[module_lower] = self._status_from_df_mod(df_mod, module_lower)
+        return all_statuses
 
     def query(self) -> pd.DataFrame:
         raise NotImplementedError
