@@ -27,7 +27,8 @@ import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 import config
-from modules.excel_reader import ExcelReader, SubsysRecord
+from modules.eta_checker      import ETAChecker
+from modules.excel_reader     import ExcelReader, SubsysRecord
 from modules.splunk_connector import _BaseConnector
 from modules.teams_notifier   import MockTeamsNotifier
 
@@ -52,16 +53,22 @@ class AutomationScheduler:
     sp_connector   : sharepoint_connector.*
     splunk         : splunk_connector.*
     notifier       : teams_notifier.*
+    llm            : optional LLM_cls instance (has .simple_query(prompt)->str).
+                     When supplied, ETA fields are parsed/corrected by the LLM.
     """
 
-    def __init__(self, sp_connector, splunk, notifier):
+    def __init__(self, sp_connector, splunk, notifier, llm=None):
         self.sp       = sp_connector
         self.splunk   = splunk
         self.notifier = notifier
+        self.llm      = llm
         self.tz       = pytz.timezone(config.TIMEZONE)
 
+        # ETAChecker is created once; it holds the LLM reference
+        self.eta_checker = ETAChecker(llm=llm, notifier=notifier)
+
         hour, minute = _parse_time(config.DAILY_SUMMARY_TIME)
-        # Reminder runs 1 hour before summary
+        # Reminder / ETA-checker runs 1 hour before summary
         remind_hour   = (hour - 1) % 24
         remind_minute = minute
 
@@ -89,6 +96,14 @@ class AutomationScheduler:
             minute=minute,
             id="overdue_tracker",
             name="Overdue Tracker",
+        )
+        self._scheduler.add_job(
+            self._run_eta_checker,
+            trigger="cron",
+            hour=remind_hour,
+            minute=remind_minute,
+            id="eta_checker",
+            name="LLM ETA Checker",
         )
         logger.info(
             f"[Scheduler] Jobs configured. "
@@ -132,31 +147,61 @@ class AutomationScheduler:
 
     # ----------------------------------------------------------
     def _run_eta_reminder(self):
+        """
+        ETA reminder: for each record whose PPT ETA is *tomorrow*,
+        send a reminder.  Uses ETAChecker to parse any date format.
+        """
         logger.info("[Scheduler] ▶ Running: eta_reminder")
         try:
             records, _ = self._fetch_data()
             tomorrow   = date.today() + timedelta(days=1)
             for rec in records:
-                # Check PPT ETA
-                self._check_eta_field(rec, "ppt", rec.ppt_status, tomorrow)
+                result = self.eta_checker.parse_eta(rec.ppt_status)
+                if result.parsed and result.parsed == tomorrow:
+                    logger.info(
+                        f"[Scheduler] Reminder: {rec.subsys}/ppt ETA is "
+                        f"tomorrow ({result.iso})"
+                    )
+                    self.notifier.send_eta_reminder(rec, "ppt", result.iso)
         except Exception as exc:
             logger.error(f"[Scheduler] ❌ eta_reminder failed: {exc}", exc_info=True)
 
-    def _check_eta_field(self, rec: SubsysRecord, field: str, val: str, tomorrow: date):
-        """Send reminder if a user-supplied ETA is tomorrow."""
-        if not val:
-            return
-        val_lower = val.lower().strip()
-        if val_lower in ("done", "v", "x", "n/a"):
-            return
-        eta_str = val_lower.replace("eta:", "").strip()
+    # ----------------------------------------------------------
+    def _run_eta_checker(self):
+        """
+        LLM ETA Checker:
+          - Parses all ETA fields using the LLM (if available) to normalise
+            fuzzy date strings and detect year-flip typos.
+          - For blank ETA/upload fields, sends a Teams nudge to the owner.
+          - Logs a report of all anomalies found.
+        """
+        logger.info("[Scheduler] ▶ Running: eta_checker")
         try:
-            eta = datetime.strptime(eta_str, "%Y-%m-%d").date()
-            if eta == tomorrow:
-                logger.info(f"[Scheduler] Reminder: {rec.subsys} {field} ETA is tomorrow ({eta})")
-                self.notifier.send_eta_reminder(rec, field, str(eta))
-        except ValueError:
-            pass   # not a parseable date
+            records, splunk_data = self._fetch_data()
+            report = self.eta_checker.check_records(
+                records,
+                splunk_data,
+                nudge_blank=True,
+            )
+            if report:
+                logger.info(
+                    f"[Scheduler] ℹ️ eta_checker found {len(report)} item(s) to flag:"
+                )
+                for item in report:
+                    eta_r    = item.get("eta_result")
+                    iso_str  = eta_r.iso if eta_r else "-"
+                    corrected = " [⚠️ year corrected]" if eta_r and eta_r.corrected else ""
+                    logger.info(
+                        f"  {item['subsys']}/{item['field']} "
+                        f"status={item['status']} "
+                        f"raw={item.get('raw', '')!r} "
+                        f"parsed={iso_str}{corrected} "
+                        f"owner={item['owner']}"
+                    )
+            else:
+                logger.info("[Scheduler] ✅ eta_checker: no anomalies found.")
+        except Exception as exc:
+            logger.error(f"[Scheduler] ❌ eta_checker failed: {exc}", exc_info=True)
 
     # ----------------------------------------------------------
     def _run_overdue_tracker(self):
@@ -203,6 +248,7 @@ class AutomationScheduler:
             "daily_summary":   self._run_daily_summary,
             "eta_reminder":    self._run_eta_reminder,
             "overdue_tracker": self._run_overdue_tracker,
+            "eta_checker":     self._run_eta_checker,
         }
         fn = job_map.get(job_id)
         if fn:

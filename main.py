@@ -3,7 +3,8 @@ main.py — Entry point for the FDI DEF automation system.
 
 Run modes:
   python main.py               → Start the daily scheduler (blocking)
-  python main.py --run-now     → Trigger all 3 jobs once immediately, then exit
+  python main.py --run-now     → Trigger all jobs once immediately, then exit
+  python main.py --check-eta   → Run only the LLM ETA-checker job, then exit
   python main.py --llm-prompt  → Generate & print the LLM Excel analysis prompt
 """
 
@@ -26,10 +27,24 @@ def build_stack():
     from modules.teams_notifier        import get_notifier
     from modules.scheduler             import AutomationScheduler
 
-    sp      = sp_conn()
-    splunk  = splunk_conn()
+    sp       = sp_conn()
+    splunk   = splunk_conn()
     notifier = get_notifier()
-    scheduler = AutomationScheduler(sp, splunk, notifier)
+
+    # Optional LLM — import gracefully so the system works without it
+    llm = None
+    try:
+        from modules.llm_connector import LLM_cls   # your LangChain wrapper
+        llm = LLM_cls()
+        import logging
+        logging.getLogger("main").info("LLM connector loaded successfully.")
+    except ImportError:
+        import logging
+        logging.getLogger("main").warning(
+            "modules/llm_connector.py not found — ETAChecker will use regex only."
+        )
+
+    scheduler = AutomationScheduler(sp, splunk, notifier, llm=llm)
     return scheduler
 
 
@@ -40,7 +55,12 @@ def main():
     parser.add_argument(
         "--run-now",
         action="store_true",
-        help="Run all 3 jobs immediately and exit (for testing)",
+        help="Run all jobs immediately and exit (for testing)",
+    )
+    parser.add_argument(
+        "--check-eta",
+        action="store_true",
+        help="Run only the LLM ETA-checker job and exit",
     )
     parser.add_argument(
         "--llm-prompt",
@@ -67,8 +87,13 @@ def main():
 
     scheduler = build_stack()
 
-    if args.run_now:
+    if args.check_eta:
+        logger.info("=== Running ETA checker (--check-eta) ===")
+        scheduler.run_now("eta_checker")
+        logger.info("=== Done ===")
+    elif args.run_now:
         logger.info("=== Running all jobs immediately (--run-now) ===")
+        scheduler.run_now("eta_checker")
         scheduler.run_now("eta_reminder")
         scheduler.run_now("daily_summary")
         scheduler.run_now("overdue_tracker")

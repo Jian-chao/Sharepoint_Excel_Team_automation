@@ -145,6 +145,22 @@ def _build_overdue_html(rec: SubsysRecord, field: str) -> str:
     )
 
 
+def _build_blank_eta_nudge_html(rec: SubsysRecord, field: str) -> str:
+    """
+    Message sent to the owner when their ETA / upload field is blank.
+    Politely asks them to fill in an expected upload date.
+    """
+    owner      = rec.be or rec.fe or "team"
+    field_name = field.replace("_status", "").upper()
+    return (
+        f"<p>📅 <b>ETA Request:</b> The <b>{field_name}</b> upload field for "
+        f"subsys <b>{rec.subsys}</b> is currently blank.<br>"
+        f"Hi <b>{owner}</b>, please reply with your expected upload date "
+        f"so we can keep the tracker up to date. 🙏<br>"
+        f"(FE: {rec.fe} | BC: {rec.bc})</p>"
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # MOCK notifier
 # ─────────────────────────────────────────────────────────────
@@ -168,6 +184,11 @@ class MockTeamsNotifier:
 
     def send_overdue_alert(self, rec: SubsysRecord, field: str):
         html = _build_overdue_html(rec, field)
+        self.post_to_chat(html)
+
+    def send_blank_eta_nudge(self, rec: SubsysRecord, field: str):
+        """Nudge the owner to fill in their ETA for a blank field."""
+        html = _build_blank_eta_nudge_html(rec, field)
         self.post_to_chat(html)
 
     def poll_chat_messages(self, chat_id: str, since: Optional[datetime] = None) -> list[dict]:
@@ -292,6 +313,16 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
         chat_id: Optional[str] = None,
     ):
         html = _build_overdue_html(rec, field)
+        return self.post_to_chat(html, chat_id)
+
+    def send_blank_eta_nudge(                                 # --- REMOTE ONLY ---
+        self,
+        rec: SubsysRecord,
+        field: str,
+        chat_id: Optional[str] = None,
+    ):
+        """Nudge the owner to fill in their ETA for a blank field."""
+        html = _build_blank_eta_nudge_html(rec, field)
         return self.post_to_chat(html, chat_id)
 
     def poll_chat_messages(                                   # --- REMOTE ONLY ---
