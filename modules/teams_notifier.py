@@ -2,21 +2,40 @@
 modules/teams_notifier.py
 ==========================
 Posts messages to a Microsoft Teams group chat using Microsoft Graph API.
-Authentication via MSAL ConfidentialClientApplication (ROPC flow).
+Authentication via a custom MSALCredential that wraps
+msal.ConfidentialClientApplication and exposes the azure.core
+TokenCredential protocol so it can be passed directly to GraphServiceClient.
 
 Two implementations:
-  MockTeamsNotifier   — prints messages to stdout (current machine, no Azure)
-  RemoteTeamsNotifier — real Graph API calls (activate on remote machine)
+  MockTeamsNotifier   — prints messages to stdout (no Azure required)
+  RemoteTeamsNotifier — real Graph API via msgraph-sdk  (--- REMOTE ONLY ---)
 
-All Teams credentials are read from environment variables.  See config.py for
-the full list.  Search "--- REMOTE ONLY ---" to find every placeholder.
+All public methods on both implementations are **async** so callers can
+``await`` them uniformly regardless of which notifier is active:
 
-Usage:
-    from modules.teams_notifier import get_notifier
-    notifier = get_notifier()
-    notifier.post_daily_summary(records, splunk_df)
-    notifier.send_eta_reminder(record)
-    notifier.send_overdue_alert(record)
+    await notifier.post_daily_summary(records, splunk_data)
+    await notifier.send_eta_reminder(record, "netlist", "2026-03-05")
+    await notifier.send_overdue_alert(record, "sdc")
+
+The Remote notifier builds and sends chat messages using the fluent
+msgraph request-builder API:
+
+    result = await client.chats.by_chat_id(chat_id).messages.post(request_body)
+
+and reads messages with an OData $filter via MessagesRequestBuilder /
+RequestConfiguration from kiota_abstractions.
+
+Required env vars for RemoteTeamsNotifier (set on remote machine):
+    TEAMS_AUTHORITY      https://login.microsoftonline.com/<tenant_id>
+    TEAMS_CLIENT_ID      Azure app registration client ID
+    TEAMS_CLIENT_SECRET  Client secret value
+    TEAMS_USERNAME       UPN of the delegated user (ROPC flow); leave blank
+                         for app-only client-credentials flow
+    TEAMS_PASSWORD       Password (ROPC flow only)
+    TEAMS_SCOPES         Space-separated scopes, e.g. "https://graph.microsoft.com/.default"
+    TEAMS_CHAT_ID        Target group-chat ID
+
+Search "--- REMOTE ONLY ---" to find every placeholder.
 """
 
 import logging
@@ -40,7 +59,7 @@ def get_notifier():
 
 
 # ─────────────────────────────────────────────────────────────
-# Message formatting helpers (shared)
+# Message formatting helpers (shared, synchronous)
 # ─────────────────────────────────────────────────────────────
 
 def _status_icon(val: str, splunk_val: Optional[bool] = None) -> str:
@@ -71,7 +90,6 @@ def _ppt_icon(val: str, deadline: date) -> str:
         return "✅ Done"
     if val.lower() == "n/a":
         return "➖ N/A"
-    # Could be an ETA string
     try:
         eta = datetime.strptime(val.replace("eta:", "").strip(), "%Y-%m-%d").date()
         days_left = (eta - date.today()).days
@@ -89,7 +107,6 @@ def _build_summary_html(records: list[SubsysRecord], splunk_data: dict) -> str:
     Build an HTML table for posting to Teams via Graph API.
     splunk_data: {subsys_name: {"netlist": bool|None, "sdc": bool|None, ...}}
     """
-    # Parse deadline from G1 cell value (stored as a string like "BE upload ... before 2/26 11:59 HQ")
     deadline = date(2026, 2, 26)   # fallback — update from config or dynamic parse
 
     rows_html = ""
@@ -162,59 +179,73 @@ def _build_blank_eta_nudge_html(rec: SubsysRecord, field: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# MOCK notifier
+# MOCK notifier  (all methods are async for interface parity)
 # ─────────────────────────────────────────────────────────────
 
 class MockTeamsNotifier:
-    """Prints messages to stdout — no actual Graph API calls."""
+    """
+    Prints messages to stdout — no actual Graph API calls.
 
-    def post_to_chat(self, html_body: str, chat_id: str = "MOCK"):
+    All public methods are ``async def`` so callers can uniformly
+    ``await`` them whether Mock or Remote is in use.
+    """
+
+    async def post_to_chat(self, html_body: str, chat_id: str = "MOCK"):
         print(f"\n{'='*60}")
         print(f"[MockTeams] → Chat: {chat_id}")
         print(html_body)
         print(f"{'='*60}\n")
 
-    def post_daily_summary(self, records: list[SubsysRecord], splunk_data: dict):
+    async def post_daily_summary(
+        self, records: list[SubsysRecord], splunk_data: dict
+    ):
         html = _build_summary_html(records, splunk_data)
-        self.post_to_chat(html)
+        await self.post_to_chat(html)
 
-    def send_eta_reminder(self, rec: SubsysRecord, field: str, eta: str):
+    async def send_eta_reminder(self, rec: SubsysRecord, field: str, eta: str):
         html = _build_reminder_html(rec, field, eta)
-        self.post_to_chat(html)
+        await self.post_to_chat(html)
 
-    def send_overdue_alert(self, rec: SubsysRecord, field: str):
+    async def send_overdue_alert(self, rec: SubsysRecord, field: str):
         html = _build_overdue_html(rec, field)
-        self.post_to_chat(html)
+        await self.post_to_chat(html)
 
-    def send_blank_eta_nudge(self, rec: SubsysRecord, field: str):
+    async def send_blank_eta_nudge(self, rec: SubsysRecord, field: str):
         """Nudge the owner to fill in their ETA for a blank field."""
         html = _build_blank_eta_nudge_html(rec, field)
-        self.post_to_chat(html)
+        await self.post_to_chat(html)
 
-    def poll_chat_messages(self, chat_id: str, since: Optional[datetime] = None) -> list[dict]:
+    async def poll_chat_messages(
+        self,
+        chat_id: str = "MOCK",
+        since: Optional[datetime] = None,
+    ) -> list:
         logger.info("[MockTeams] poll_chat_messages — returning empty list (mock)")
         return []
 
 
 # ─────────────────────────────────────────────────────────────
-# REMOTE notifier  (Graph API via MSAL)  --- REMOTE ONLY ---
+# MSAL credential adapter          --- REMOTE ONLY ---
 # ─────────────────────────────────────────────────────────────
 
-class RemoteTeamsNotifier:                                     # --- REMOTE ONLY ---
+class MSALCredential:                                          # --- REMOTE ONLY ---
     """
-    Authenticates with Microsoft Graph API using MSAL ConfidentialClientApplication
-    (ROPC flow: username + password with client credentials).
+    Implements the ``azure.core.credentials.TokenCredential`` protocol
+    backed by an MSAL ``ConfidentialClientApplication``.
 
-    Required env vars (set on remote machine):
-        TEAMS_AUTHORITY      https://login.microsoftonline.com/<tenant_id>
-        TEAMS_CLIENT_ID      Azure app client ID
-        TEAMS_CLIENT_SECRET  Azure app client secret
-        TEAMS_CLIENT_VALUE   (same as secret, or a separate value field)
-        TEAMS_OBJECT_ID      Azure app object ID
-        TEAMS_USERNAME       UPN of the user account (e.g. you@company.com)
-        TEAMS_PASSWORD       Password for that user account
-        TEAMS_ENDPOINT       https://graph.microsoft.com/v1.0
-        TEAMS_CHAT_ID        ID of the target group chat
+    Compatible with ``GraphServiceClient`` through
+    ``kiota_authentication_azure.AzureIdentityAuthenticationProvider``.
+
+    Token acquisition strategy
+    --------------------------
+    1. Try the MSAL in-memory token cache (silent refresh).
+    2. If a ``TEAMS_USERNAME`` / ``TEAMS_PASSWORD`` are configured:
+       use the **ROPC** (resource-owner password credentials) flow.
+    3. Otherwise fall back to the **client-credentials** (app-only) flow.
+
+    The returned ``AccessToken`` is the
+    ``azure.core.credentials.AccessToken(token, expires_on)`` namedtuple
+    that kiota_authentication_azure expects.
     """
 
     def __init__(self):
@@ -223,135 +254,292 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
         except ImportError:
             raise ImportError("Install msal: pip install msal")
 
-        import msal
-        self._msal_app = msal.ConfidentialClientApplication(  # --- REMOTE ONLY ---
+        import msal  # noqa: F811  (re-import after the try/except guard)
+        self.app = msal.ConfidentialClientApplication(         # --- REMOTE ONLY ---
             client_id         = config.TEAMS_CLIENT_ID,
             client_credential = config.TEAMS_CLIENT_SECRET,
             authority         = config.TEAMS_AUTHORITY,
         )
-        self._token: Optional[str] = None
-        self._endpoint = config.TEAMS_ENDPOINT.rstrip("/")
+
+    def get_token(self, *scopes: str, **kwargs) -> "AccessToken":  # --- REMOTE ONLY ---
+        """
+        Acquire (or refresh) an access token.
+
+        Parameters
+        ----------
+        *scopes : str
+            One or more OAuth2 scope strings, e.g.
+            ``"https://graph.microsoft.com/.default"``.
+
+        Returns
+        -------
+        azure.core.credentials.AccessToken
+            A ``(token, expires_on)`` namedtuple.
+
+        Raises
+        ------
+        RuntimeError
+            If token acquisition fails after all attempts.
+        """
+        import time
+        from azure.core.credentials import AccessToken          # --- REMOTE ONLY ---
+
+        scope_list = list(scopes) or config.TEAMS_SCOPES
+
+        # 1 — Try the MSAL in-memory cache first (avoids unnecessary round-trips)
+        result = None
+        accounts = self.app.get_accounts()
+        if accounts:
+            result = self.app.acquire_token_silent(
+                scopes  = scope_list,
+                account = accounts[0],
+            )
+
+        # 2 — Delegated (ROPC) flow when username/password are configured
+        if not result or "access_token" not in result:
+            username = getattr(config, "TEAMS_USERNAME", "")
+            password = getattr(config, "TEAMS_PASSWORD", "")
+            if username and password:
+                result = self.app.acquire_token_by_username_password(
+                    username = username,
+                    password = password,
+                    scopes   = scope_list,
+                )
+            else:
+                # 3 — App-only client-credentials flow
+                result = self.app.acquire_token_for_client(scopes=scope_list)
+
+        if not result or "access_token" not in result:
+            err = (result or {}).get(
+                "error_description",
+                (result or {}).get("error", "Unknown MSAL error"),
+            )
+            raise RuntimeError(f"[MSALCredential] Token acquisition failed: {err}")
+
+        expires_on = int(time.time()) + result.get("expires_in", 3600)
+        logger.debug("[MSALCredential] Token acquired/refreshed.")
+        return AccessToken(result["access_token"], expires_on)
+
+
+# ─────────────────────────────────────────────────────────────
+# REMOTE notifier  (msgraph SDK + kiota)   --- REMOTE ONLY ---
+# ─────────────────────────────────────────────────────────────
+
+class RemoteTeamsNotifier:                                     # --- REMOTE ONLY ---
+    """
+    Posts and reads Teams chat messages via the Microsoft Graph SDK
+    (``msgraph-sdk``).
+
+    Authentication
+    --------------
+    Uses :class:`MSALCredential` (above) which is passed to
+    ``kiota_authentication_azure.AzureIdentityAuthenticationProvider``
+    and then to ``GraphServiceClient``.
+
+    Message construction
+    --------------------
+    Messages are built with the msgraph model classes::
+
+        from msgraph.generated.models.chat_message import ChatMessage
+        from msgraph.generated.models.item_body    import ItemBody
+        from msgraph.generated.models.body_type    import BodyType
+
+    and sent through the fluent request-builder API::
+
+        result = await client.chats.by_chat_id(chat_id).messages.post(request_body)
+
+    Message listing uses ``MessagesRequestBuilder`` query parameters wrapped
+    in a ``kiota_abstractions.base_request_configuration.RequestConfiguration``::
+
+        from msgraph.generated.chats.item.messages.messages_request_builder import (
+            MessagesRequestBuilder,
+        )
+        from kiota_abstractions.base_request_configuration import RequestConfiguration
+
+    Dependencies (install on remote machine)
+    -----------------------------------------
+        pip install msgraph-sdk kiota-authentication-azure azure-core msal
+    """
+
+    def __init__(self):                                        # --- REMOTE ONLY ---
+        try:
+            from msgraph import GraphServiceClient             # --- REMOTE ONLY ---
+            from kiota_authentication_azure.azure_identity_authentication_provider import (
+                AzureIdentityAuthenticationProvider,
+            )
+        except ImportError:
+            raise ImportError(
+                "Install msgraph dependencies:\n"
+                "  pip install msgraph-sdk kiota-authentication-azure azure-core"
+            )
+
+        credential   = MSALCredential()                        # --- REMOTE ONLY ---
+        auth_provider = AzureIdentityAuthenticationProvider(
+            credentials = credential,
+            scopes      = config.TEAMS_SCOPES,
+        )
+        self._client       = GraphServiceClient(               # --- REMOTE ONLY ---
+            credentials = credential,
+            scopes      = config.TEAMS_SCOPES,
+        )
         self._default_chat = config.TEAMS_CHAT_ID
 
-    def _get_token(self) -> str:                              # --- REMOTE ONLY ---
-        """Acquire (or refresh) the Graph API access token using ROPC flow."""
-        # Try cache first
-        accounts = self._msal_app.get_accounts(username=config.TEAMS_USERNAME)
-        if accounts:
-            result = self._msal_app.acquire_token_silent(
-                scopes=config.TEAMS_SCOPES, account=accounts[0]
-            )
-            if result and "access_token" in result:
-                return result["access_token"]
-
-        # ROPC flow (username + password)
-        result = self._msal_app.acquire_token_by_username_password(
-            username = config.TEAMS_USERNAME,
-            password = config.TEAMS_PASSWORD,
-            scopes   = config.TEAMS_SCOPES,
-        )
-        if "access_token" not in result:
-            err = result.get("error_description", result.get("error", "Unknown"))
-            raise RuntimeError(f"[Teams] MSAL token acquisition failed: {err}")
-
-        logger.info("[Teams] Acquired new access token via ROPC.")
-        return result["access_token"]
-
-    def _headers(self) -> dict:                               # --- REMOTE ONLY ---
-        return {
-            "Authorization": f"Bearer {self._get_token()}",
-            "Content-Type":  "application/json",
-        }
-
-    def post_to_chat(                                         # --- REMOTE ONLY ---
+    # ----------------------------------------------------------
+    async def post_to_chat(                                    # --- REMOTE ONLY ---
         self,
         html_body: str,
-        chat_id: Optional[str] = None,
-    ) -> dict:
+        chat_id:   Optional[str] = None,
+    ):
         """
-        POST an HTML message to a Teams group chat.
-        Graph API: POST /v1.0/chats/{chat-id}/messages
-        Docs: https://learn.microsoft.com/en-us/graph/api/chat-post-messages
-        """
-        import requests
-        chat_id = chat_id or self._default_chat
-        url     = f"{self._endpoint}/chats/{chat_id}/messages"
-        payload = {
-            "body": {
-                "contentType": "html",
-                "content":     html_body,
-            }
-        }
-        resp = requests.post(url, headers=self._headers(), json=payload)
-        resp.raise_for_status()
-        logger.info(f"[Teams] Message posted to chat {chat_id}.")
-        return resp.json()
+        POST an HTML-formatted message to a Teams group chat.
 
-    def post_daily_summary(                                   # --- REMOTE ONLY ---
+        Uses the fluent msgraph request-builder pattern::
+
+            result = await client.chats.by_chat_id(chat_id).messages.post(body)
+
+        Graph API reference:
+        https://learn.microsoft.com/en-us/graph/api/chat-post-messages
+
+        Parameters
+        ----------
+        html_body : str
+            HTML content to send.
+        chat_id : str, optional
+            Target chat ID; defaults to ``config.TEAMS_CHAT_ID``.
+
+        Returns
+        -------
+        msgraph.generated.models.chat_message.ChatMessage
+            The created message object returned by the Graph API.
+        """
+        from msgraph.generated.models.chat_message import ChatMessage
+        from msgraph.generated.models.item_body    import ItemBody
+        from msgraph.generated.models.body_type    import BodyType
+
+        chat_id = chat_id or self._default_chat
+
+        # Build request body using msgraph model classes
+        request_body            = ChatMessage()
+        request_body.body       = ItemBody()
+        request_body.body.content_type = BodyType.Html
+        request_body.body.content      = html_body
+
+        result = await self._client.chats.by_chat_id(chat_id).messages.post(
+            request_body
+        )
+        logger.info(f"[Teams] Message posted to chat {chat_id}.")
+        return result
+
+    # ----------------------------------------------------------
+    async def post_daily_summary(                              # --- REMOTE ONLY ---
         self,
-        records: list[SubsysRecord],
+        records:     list[SubsysRecord],
         splunk_data: dict,
-        chat_id: Optional[str] = None,
+        chat_id:     Optional[str] = None,
     ):
         html = _build_summary_html(records, splunk_data)
-        return self.post_to_chat(html, chat_id)
+        return await self.post_to_chat(html, chat_id)
 
-    def send_eta_reminder(                                    # --- REMOTE ONLY ---
+    async def send_eta_reminder(                               # --- REMOTE ONLY ---
         self,
-        rec: SubsysRecord,
-        field: str,
-        eta: str,
+        rec:     SubsysRecord,
+        field:   str,
+        eta:     str,
         chat_id: Optional[str] = None,
     ):
         html = _build_reminder_html(rec, field, eta)
-        return self.post_to_chat(html, chat_id)
+        return await self.post_to_chat(html, chat_id)
 
-    def send_overdue_alert(                                   # --- REMOTE ONLY ---
+    async def send_overdue_alert(                              # --- REMOTE ONLY ---
         self,
-        rec: SubsysRecord,
-        field: str,
+        rec:     SubsysRecord,
+        field:   str,
         chat_id: Optional[str] = None,
     ):
         html = _build_overdue_html(rec, field)
-        return self.post_to_chat(html, chat_id)
+        return await self.post_to_chat(html, chat_id)
 
-    def send_blank_eta_nudge(                                 # --- REMOTE ONLY ---
+    async def send_blank_eta_nudge(                            # --- REMOTE ONLY ---
         self,
-        rec: SubsysRecord,
-        field: str,
+        rec:     SubsysRecord,
+        field:   str,
         chat_id: Optional[str] = None,
     ):
-        """Nudge the owner to fill in their ETA for a blank field."""
+        """Nudge the owner to fill in their ETA for a blank upload field."""
         html = _build_blank_eta_nudge_html(rec, field)
-        return self.post_to_chat(html, chat_id)
+        return await self.post_to_chat(html, chat_id)
 
-    def poll_chat_messages(                                   # --- REMOTE ONLY ---
+    # ----------------------------------------------------------
+    async def poll_chat_messages(                              # --- REMOTE ONLY ---
         self,
-        chat_id: Optional[str] = None,
-        since: Optional[datetime] = None,
-    ) -> list[dict]:
+        chat_id: Optional[str]       = None,
+        since:   Optional[datetime]  = None,
+    ) -> list:
         """
-        Poll recent messages from the group chat.
-        Useful for reading ETA replies from owners.
-        Graph API: GET /v1.0/chats/{chat-id}/messages
+        Read recent messages from the group chat.
+
+        Uses ``MessagesRequestBuilder`` query parameters and
+        ``kiota_abstractions.base_request_configuration.RequestConfiguration``
+        to apply an OData ``$filter`` when *since* is given::
+
+            from msgraph.generated.chats.item.messages.messages_request_builder import (
+                MessagesRequestBuilder,
+            )
+            from kiota_abstractions.base_request_configuration import RequestConfiguration
+
+            query_params = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+                filter="createdDateTime ge 2026-03-01T00:00:00Z",
+                top=50,
+            )
+            config = RequestConfiguration(query_parameters=query_params)
+            result = await client.chats.by_chat_id(chat_id).messages.get(
+                request_configuration=config
+            )
+
+        Parameters
+        ----------
+        chat_id : str, optional
+            Source chat ID; defaults to ``config.TEAMS_CHAT_ID``.
+        since : datetime, optional
+            If given, only messages created at or after this UTC time are
+            returned (OData ``$filter`` on ``createdDateTime``).
+
+        Returns
+        -------
+        list[msgraph.generated.models.chat_message.ChatMessage]
         """
-        import requests
+        from msgraph.generated.chats.item.messages.messages_request_builder import (
+            MessagesRequestBuilder,
+        )
+        from kiota_abstractions.base_request_configuration import RequestConfiguration
+
         chat_id = chat_id or self._default_chat
-        url     = f"{self._endpoint}/chats/{chat_id}/messages"
-        params  = {}
+
         if since:
-            params["$filter"] = f"createdDateTime ge {since.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-        resp = requests.get(url, headers=self._headers(), params=params)
-        resp.raise_for_status()
-        messages = resp.json().get("value", [])
+            since_str    = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+            query_params = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+                filter = f"createdDateTime ge {since_str}",
+                top    = 50,
+            )
+            request_config = RequestConfiguration(query_parameters=query_params)
+            result = await self._client.chats.by_chat_id(chat_id).messages.get(
+                request_configuration=request_config
+            )
+        else:
+            result = await self._client.chats.by_chat_id(chat_id).messages.get()
+
+        messages = result.value if result and result.value else []
         logger.info(f"[Teams] Polled {len(messages)} message(s) from chat {chat_id}.")
         return messages
 
-    def get_user_display_name(self, upn: str) -> str:        # --- REMOTE ONLY ---
+    # ----------------------------------------------------------
+    async def get_user_display_name(self, upn: str) -> str:   # --- REMOTE ONLY ---
         """Resolve a user's display name from their UPN via Graph API."""
-        import requests
-        url  = f"{self._endpoint}/users/{upn}"
-        resp = requests.get(url, headers=self._headers())
-        if resp.ok:
-            return resp.json().get("displayName", upn)
-        return upn
+        try:
+            result = await self._client.users.by_user_id(upn).get()
+            return result.display_name or upn
+        except Exception as exc:
+            logger.warning(
+                f"[Teams] Could not resolve display name for {upn!r}: {exc}"
+            )
+            return upn

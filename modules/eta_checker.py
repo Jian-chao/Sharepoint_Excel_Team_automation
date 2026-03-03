@@ -228,7 +228,7 @@ class ETAChecker:
                     continue
                 if not raw_val or raw_val.strip() == "":
                     if nudge_blank and self._notifier:
-                        self._send_blank_nudge(rec, fld)
+                        await self._send_blank_nudge(rec, fld)
                     report.append({
                         "subsys": rec.subsys,
                         "field":  fld,
@@ -276,7 +276,7 @@ class ETAChecker:
 
             if result.is_blank:
                 if nudge_blank and self._notifier:
-                    self._send_blank_nudge(rec, "ppt_status")
+                    await self._send_blank_nudge(rec, "ppt_status")
                 entry["status"] = "blank"
                 report.append(entry)
                 continue
@@ -409,12 +409,14 @@ Do NOT include any explanation outside the JSON object."""
             return corrected, True
         return d, False
 
-    def _send_blank_nudge(self, rec, field: str):
+    async def _send_blank_nudge(self, rec, field: str):
         """
         Post a Teams message asking the owner for their ETA.
 
-        Uses ``notifier.send_blank_eta_nudge()`` if available, otherwise
-        falls back to ``post_to_chat()`` with a plain HTML message.
+        Awaits ``notifier.send_blank_eta_nudge()`` if available, otherwise
+        falls back to ``notifier.post_to_chat()`` with a plain HTML message.
+        Both notifier implementations are now async, so this method
+        must also be ``async def``.
         """
         owner      = rec.be or rec.fe or "owner"
         field_name = field.replace("_status", "").upper()
@@ -428,7 +430,7 @@ Do NOT include any explanation outside the JSON object."""
         # Use dedicated method if the notifier exposes it
         if hasattr(self._notifier, "send_blank_eta_nudge"):
             try:
-                self._notifier.send_blank_eta_nudge(rec, field)
+                await self._notifier.send_blank_eta_nudge(rec, field)
                 return
             except Exception as e:
                 logger.warning(f"[ETAChecker] send_blank_eta_nudge failed: {e}")
@@ -436,9 +438,11 @@ Do NOT include any explanation outside the JSON object."""
         # Fallback: generic post_to_chat
         if hasattr(self._notifier, "post_to_chat"):
             try:
-                self._notifier.post_to_chat(html)
+                await self._notifier.post_to_chat(html)
             except Exception as e:
                 logger.warning(f"[ETAChecker] post_to_chat fallback failed: {e}")
         else:
-            logger.info(f"[ETAChecker] (no notifier) Blank ETA nudge for "
-                        f"{rec.subsys}/{field} → {owner}: {html}")
+            logger.info(
+                f"[ETAChecker] (no notifier) Blank ETA nudge for "
+                f"{rec.subsys}/{field} \u2192 {owner}"
+            )

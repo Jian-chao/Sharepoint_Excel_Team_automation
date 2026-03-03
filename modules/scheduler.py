@@ -144,11 +144,11 @@ class AutomationScheduler:
         return records, splunk_data
 
     # ----------------------------------------------------------
-    def _run_daily_summary(self):
+    async def _run_daily_summary(self):
         logger.info("[Scheduler] ▶ Running: daily_summary")
         try:
             records, splunk_data = self._fetch_data()
-            self.notifier.post_daily_summary(records, splunk_data)
+            await self.notifier.post_daily_summary(records, splunk_data)
             logger.info("[Scheduler] ✅ daily_summary done.")
         except Exception as exc:
             logger.error(f"[Scheduler] ❌ daily_summary failed: {exc}", exc_info=True)
@@ -174,7 +174,7 @@ class AutomationScheduler:
                         f"[Scheduler] Reminder: {rec.subsys}/ppt ETA is "
                         f"tomorrow ({result.iso})"
                     )
-                    self.notifier.send_eta_reminder(rec, "ppt", result.iso)
+                    await self.notifier.send_eta_reminder(rec, "ppt", result.iso)
         except Exception as exc:
             logger.error(f"[Scheduler] ❌ eta_reminder failed: {exc}", exc_info=True)
 
@@ -217,7 +217,7 @@ class AutomationScheduler:
             logger.error(f"[Scheduler] ❌ eta_checker failed: {exc}", exc_info=True)
 
     # ----------------------------------------------------------
-    def _run_overdue_tracker(self):
+    async def _run_overdue_tracker(self):
         logger.info("[Scheduler] ▶ Running: overdue_tracker")
         try:
             records, splunk_data = self._fetch_data()
@@ -242,7 +242,7 @@ class AutomationScheduler:
                     )
                     if not uploaded and today > deadline:
                         logger.warning(f"[Scheduler] OVERDUE: {rec.subsys}/{field}")
-                        self.notifier.send_overdue_alert(rec, field)
+                        await self.notifier.send_overdue_alert(rec, field)
         except Exception as exc:
             logger.error(f"[Scheduler] ❌ overdue_tracker failed: {exc}", exc_info=True)
 
