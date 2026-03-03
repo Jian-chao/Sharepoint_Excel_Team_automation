@@ -247,34 +247,43 @@ class AutomationScheduler:
             logger.error(f"[Scheduler] ❌ overdue_tracker failed: {exc}", exc_info=True)
 
     # ----------------------------------------------------------
+    async def _async_run(self):
+        """
+        Async entry-point that keeps the event loop alive until cancelled.
+
+        Called exclusively by :meth:`start` via ``asyncio.run()``.
+        Separated from ``start()`` as a proper class method so that
+        Pylance / static analysers do not flag spurious indentation warnings
+        caused by a nested ``async def`` inside a plain ``def``.
+        """
+        self._scheduler.start()
+        logger.info("[Scheduler] Started. Press Ctrl+C to stop.")
+        try:
+            # Yield to the event loop each second — keeps it alive without
+            # a busy-spin while still allowing Ctrl+C to propagate.
+            while True:
+                await asyncio.sleep(1)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            self._scheduler.shutdown(wait=False)
+            logger.info("[Scheduler] Stopped.")
+
+    # ----------------------------------------------------------
     def start(self):
         """
         Start the scheduler and block until Ctrl+C.
 
-        Runs ``asyncio.run`` internally so the caller doesn't need an
-        existing event loop.  APScheduler's ``AsyncIOScheduler`` schedules
-        all async jobs (eta_reminder, eta_checker) directly on the loop,
-        while sync jobs (daily_summary, overdue_tracker) are dispatched to
-        the default thread-pool executor.
+        Calls :meth:`_async_run` via ``asyncio.run()`` so the caller does
+        not need an existing event loop.  APScheduler's ``AsyncIOScheduler``
+        dispatches async jobs (eta_reminder, eta_checker) directly on the
+        loop and sync jobs (daily_summary, overdue_tracker) to the default
+        thread-pool executor.
         """
-        async def _run():
-            self._scheduler.start()
-            logger.info("[Scheduler] Started. Press Ctrl+C to stop.")
-            try:
-                # Yield control back to the event loop every second
-                # (keeps the loop alive without a busy-spin)
-                while True:
-                    await asyncio.sleep(1)
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                pass
-            finally:
-                self._scheduler.shutdown(wait=False)
-                logger.info("[Scheduler] Stopped.")
-
         try:
-            asyncio.run(_run())
+            asyncio.run(self._async_run())
         except (KeyboardInterrupt, SystemExit):
-            pass   # already logged inside _run()
+            pass   # already logged inside _async_run()
 
     def run_now(self, job_id: str = "daily_summary"):
         """
