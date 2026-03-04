@@ -28,28 +28,36 @@ Usage
 
 import logging
 import os
+import httpx
+import certifi
+from rich import print as pprint
+
+from langchain.prompts import PromptTemplate
+from langchain_openai import AzureChatOpenAI
+
 
 logger = logging.getLogger(__name__)
+client = httpx.Client(
+    verify=certifi.where()
+)
+httpx_client = httpx.AsyncClient(
+    verify=False
+)
 
 
 class LLM_cls:
     """
     Thin wrapper around LangChain's AzureChatOpenAI for simple single-turn
-    prompting.
+    async prompting.
 
-    Parameters
-    ----------
-    deployment : str, optional
-        Azure OpenAI deployment name.  Defaults to the
-        ``AZURE_OPENAI_DEPLOYMENT`` environment variable.
-    temperature : float
-        Sampling temperature.  Use 0 for deterministic outputs (ETA parsing).
+    The model name and endpoint are read from environment variables at
+    construction time.  No ``deployment`` or ``temperature`` parameters
+    are exposed; set them via env vars or edit the ``AzureChatOpenAI``
+    constructor below to match your Azure resource configuration.
     """
 
     def __init__(
         self,
-        deployment:   str   = "",
-        temperature:  float = 0.0,
     ):
         try:
             from langchain_openai import AzureChatOpenAI     # langchain-openai >= 0.1
@@ -58,49 +66,38 @@ class LLM_cls:
                 "Install langchain-openai: pip install langchain-openai"
             )
 
-        self._deployment = (
-            deployment
-            or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-        )
+        # self._deployment = (
+        #     deployment
+        #     or os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        # )
 
         self._llm = AzureChatOpenAI(
-            azure_deployment   = self._deployment,
+            # azure_deployment   = self._deployment,
             azure_endpoint     = os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
+            model              = 'aide-gpt-4o-mini',
             api_key            = os.environ.get("AZURE_OPENAI_API_KEY", ""),
-            api_version        = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
-            temperature        = temperature,
+            api_version        = os.environ.get("api_version", "2024-02-01"),
+            extra_headers      = {"X-User-Id": os.environ.get("azure_user_id", "xxxxxxx")},
+            http_client        = client,        # sync httpx.Client (for blocking calls)
+            http_async_client  = httpx_client,  # async httpx.AsyncClient (for ainvoke)
+            # temperature        = temperature,
         )
-        logger.info(
-            f"[LLM] AzureChatOpenAI initialised (deployment={self._deployment!r})"
-        )
+        logger.info("[LLM] AzureChatOpenAI initialised (model=aide-gpt-4o-mini)")
 
     # ----------------------------------------------------------
-    async def simple_query(self, prompt: str) -> str:
-        """
-        Send a single-turn prompt **asynchronously** and return the model's
-        reply as a string.  The caller must ``await`` this coroutine.
-
-        Uses ``AzureChatOpenAI.ainvoke`` so the asyncio event loop is
-        **never blocked** while waiting for the Azure OpenAI response.
-
-        Parameters
-        ----------
-        prompt : str
-            The full prompt text.
-
-        Returns
-        -------
-        str
-            The model's text response (content of the first message).
-        """
-        from langchain_core.messages import HumanMessage
-
-        logger.debug(f"[LLM] simple_query prompt ({len(prompt)} chars)")
-        messages = [HumanMessage(content=prompt)]
-        # ainvoke returns a coroutine — await it without blocking the loop
-        response = await self._llm.ainvoke(messages)
-        reply    = response.content
-        logger.debug(
+    async def simple_query(self, query: str) -> str:
+        prompt = PromptTemplate(
+            input_variables=["query"],
+            template=""" 你是一位智能助理，請協助回答使用者問題，
+            請只要提供被```包含在內的資訊，不要提供額外資訊
+            以下為user的問題: {query} """)
+        chain    = prompt | self._llm
+        response = await chain.ainvoke({"query": query})
+        pprint(query)
+        pprint(prompt)
+        pprint(response)
+        reply = response.content          # LangChain BaseMessage uses .content (lowercase)
+        logger.info(
             f"[LLM] simple_query reply: {reply[:120]!r}"
             f"{'...' if len(reply) > 120 else ''}"
         )

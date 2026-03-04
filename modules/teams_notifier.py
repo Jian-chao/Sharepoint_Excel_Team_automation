@@ -40,7 +40,15 @@ Search "--- REMOTE ONLY ---" to find every placeholder.
 
 import logging
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+import certifi
+
+# TYPE_CHECKING is False at runtime — this import is skipped on machines that
+# only use MockTeamsNotifier (no azure-core installed).  Pylance / mypy read it
+# during static analysis so they can resolve the AccessToken return type on
+# MSALCredential.get_token() without a top-level ImportError.
+if TYPE_CHECKING:
+    from azure.core.credentials import AccessToken      # --- REMOTE ONLY ---
 
 import config
 from modules.excel_reader import SubsysRecord
@@ -254,11 +262,14 @@ class MSALCredential:                                          # --- REMOTE ONLY
         except ImportError:
             raise ImportError("Install msal: pip install msal")
 
-        import msal  # noqa: F811  (re-import after the try/except guard)
+        session = requests.Session()
+        session.verify = certifi.where()
+        # import msal  # noqa: F811  (re-import after the try/except guard)
         self.app = msal.ConfidentialClientApplication(         # --- REMOTE ONLY ---
             client_id         = config.TEAMS_CLIENT_ID,
             client_credential = config.TEAMS_CLIENT_SECRET,
             authority         = config.TEAMS_AUTHORITY,
+            http_session      = session,
         )
 
     def get_token(self, *scopes: str, **kwargs) -> "AccessToken":  # --- REMOTE ONLY ---
@@ -282,7 +293,6 @@ class MSALCredential:                                          # --- REMOTE ONLY
             If token acquisition fails after all attempts.
         """
         import time
-        from azure.core.credentials import AccessToken          # --- REMOTE ONLY ---
 
         scope_list = list(scopes) or config.TEAMS_SCOPES
 
@@ -364,9 +374,9 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
     def __init__(self):                                        # --- REMOTE ONLY ---
         try:
             from msgraph import GraphServiceClient             # --- REMOTE ONLY ---
-            from kiota_authentication_azure.azure_identity_authentication_provider import (
-                AzureIdentityAuthenticationProvider,
-            )
+            # from kiota_authentication_azure.azure_identity_authentication_provider import (
+            #     AzureIdentityAuthenticationProvider,
+            # )
         except ImportError:
             raise ImportError(
                 "Install msgraph dependencies:\n"
@@ -374,10 +384,10 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
             )
 
         credential   = MSALCredential()                        # --- REMOTE ONLY ---
-        auth_provider = AzureIdentityAuthenticationProvider(
-            credentials = credential,
-            scopes      = config.TEAMS_SCOPES,
-        )
+        # auth_provider = AzureIdentityAuthenticationProvider(
+        #     credentials = credential,
+        #     scopes      = config.TEAMS_SCOPES,
+        # )
         self._client       = GraphServiceClient(               # --- REMOTE ONLY ---
             credentials = credential,
             scopes      = config.TEAMS_SCOPES,

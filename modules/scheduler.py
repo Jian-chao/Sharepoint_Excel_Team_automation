@@ -125,22 +125,48 @@ class AutomationScheduler:
         """Shared data fetch used by all jobs.
 
         ``splunk.query()`` is called **exactly once** per job run.
-        The returned DataFrame is processed in bulk via
-        ``get_all_statuses()`` so no extra Splunk round-trips occur.
+
+        The raw DataFrame is pivoted into a nested dict:
+
+        .. code-block:: python
+
+            {
+              "venc_top_par_wrap": {"netlist": 0.0, "sdc": 1.0, "ccf": 0.0, "upf": 1.0, "OWNER": "..."},
+              ...
+            }
+
+        Keys are the original MODULE strings from Splunk (case-preserved).
+        Values are sub-dicts where each deliverable column holds the
+        first ``Viol`` value found (float 0/1) or ``None`` if absent.
+        Downstream consumers use ``sp.get(field)`` which treats 0 → False
+        and 1 → True via the ``int(viol_val) == 1`` guard in ``_BaseConnector``.
         """
         excel_bytes = self.sp.download_excel()
         reader      = ExcelReader(excel_bytes)
         records     = reader.get_all_records(include_skipped=False)
 
         # Single Splunk query for all modules
-        splunk_df   = self.splunk.query()
-        all_statuses = self.splunk.get_all_statuses(splunk_df)
+        splunk_df = self.splunk.query()
 
-        # Build per-subsys map; fall back to empty dict if module not in Splunk
-        splunk_data = {
-            rec.subsys: all_statuses.get(rec.subsys.lower(), {col: None for col in ["netlist", "sdc", "ccf", "upf"]})
-            for rec in records
-        }
+        # Pivot: rows = MODULE, columns = SUB_GROUP (netlist/sdc/ccf/upf), values = Viol
+        # aggfunc='first' keeps the latest-timestamp row (Splunk returns newest first).
+        # where() converts NaN (missing SUB_GROUP for that module) to None so that
+        # downstream sp.get(field) returns None rather than NaN.
+        pivot_df = splunk_df.pivot_table(
+            index   = ['MODULE', 'OWNER'],
+            columns = 'SUB_GROUP',
+            values  = 'Viol',
+            aggfunc = 'first',
+        )
+        pivot_df.reset_index(inplace=True)
+
+        # Convert to {MODULE: {col: value, ...}} — use MODULE as the dict key
+        # (case-preserved so callers that do splunk_data.get(rec.subsys) work as
+        # long as subsys names in Excel match Splunk MODULE names exactly).
+        splunk_data = pivot_df.set_index('MODULE').where(
+            pivot_df.set_index('MODULE').notna(), other=None
+        ).T.to_dict()
+
         return records, splunk_data
 
     # ----------------------------------------------------------

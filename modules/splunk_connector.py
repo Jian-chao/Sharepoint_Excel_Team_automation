@@ -24,6 +24,7 @@ import json
 import logging
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 
@@ -42,7 +43,7 @@ def get_connector():
         base_url  = config.SPLUNK_BASE_URL,
         username  = config.SPLUNK_USERNAME,
         password  = config.SPLUNK_PASSWORD,
-        query     = config.SPLUNK_SEARCH_QUERY,
+        _query    = config.SPLUNK_SEARCH_QUERY,
     )
 
 
@@ -188,11 +189,11 @@ class RemoteSplunkConnector(_BaseConnector):                   # --- REMOTE ONLY
       5. Parse bytes → pandas DataFrame via io.BytesIO
     """
 
-    def __init__(self, base_url: str, username: str, password: str, query: str):
+    def __init__(self, base_url: str, username: str, password: str, _query: str):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
-        self.query    = query
+        self._query    = _query
         self._http    = None
 
     def _get_http(self):                                       # --- REMOTE ONLY ---
@@ -222,14 +223,16 @@ class RemoteSplunkConnector(_BaseConnector):                   # --- REMOTE ONLY
         auth_header = {"Authorization": f"Splunk {session_key}"}
 
         # 1. Submit search job
-        search_body = urllib.parse.urlencode({"search": "search " + self.query})
+        search_body = urllib.parse.urlencode({"search": "search " + self._query})
         _, content  = http.request(
             self.base_url + "/services/search/jobs",
             "POST",
-            headers={**auth_header, "Content-Type": "application/x-www-form-urlencoded"},
+            headers={**auth_header},
             body=search_body,
         )
-        sid = json.loads(content)["sid"]
+        # sid = json.loads(content)["sid"]
+        root = ET.fromstring(content)
+        sid = root.find("sid").text
         logger.info(f"[RemoteSplunk] Search job submitted, sid={sid}")
 
         # 2. Poll until done
