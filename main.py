@@ -89,14 +89,20 @@ def main():
 
     if args.check_eta:
         logger.info("=== Running ETA checker (--check-eta) ===")
-        scheduler.run_now("eta_checker")
+        try:
+            scheduler.run_now("eta_checker")
+        finally:
+            scheduler.close_run_loop()
         logger.info("=== Done ===")
     elif args.run_now:
         logger.info("=== Running all jobs immediately (--run-now) ===")
-        scheduler.run_now("eta_checker")
-        scheduler.run_now("eta_reminder")
-        scheduler.run_now("daily_summary")
-        scheduler.run_now("overdue_tracker")
+        try:
+            scheduler.run_now("eta_checker")
+            scheduler.run_now("eta_reminder")
+            scheduler.run_now("daily_summary")
+            scheduler.run_now("overdue_tracker")
+        finally:
+            scheduler.close_run_loop()   # release the shared loop and its connections
         logger.info("=== Done ===")
     else:
         scheduler.start()   # blocking

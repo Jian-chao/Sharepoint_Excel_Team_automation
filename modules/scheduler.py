@@ -23,6 +23,7 @@ Usage:
 import asyncio
 import logging
 from datetime import date, datetime, timedelta
+from typing import Optional
 
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -74,6 +75,13 @@ class AutomationScheduler:
 
         # ETAChecker is created once; it holds the LLM reference
         self.eta_checker = ETAChecker(llm=llm, notifier=notifier)
+
+        # Persistent event loop used exclusively by run_now().
+        # asyncio.run() creates+destroys a new loop each call, which
+        # invalidates async resources (httpx.AsyncClient inside GraphServiceClient)
+        # that are reused across multiple run_now() calls.
+        # Using a single long-lived loop avoids RuntimeError('Event loop is closed').
+        self._run_now_loop: Optional[asyncio.AbstractEventLoop] = None
 
         hour, minute = _parse_time(config.DAILY_SUMMARY_TIME)
         # Reminder / ETA-checker runs 1 hour before summary
@@ -311,13 +319,38 @@ class AutomationScheduler:
         except (KeyboardInterrupt, SystemExit):
             pass   # already logged inside _async_run()
 
+    # ----------------------------------------------------------
+    def _get_run_loop(self) -> asyncio.AbstractEventLoop:
+        """
+        Return the persistent event loop used by :meth:`run_now`.
+
+        Creates a new loop on first call (or if the previous loop was closed).
+        Storing it on the instance means all consecutive ``run_now()`` calls
+        share the SAME loop, so async resources such as the
+        ``httpx.AsyncClient`` inside ``GraphServiceClient`` remain valid
+        between calls instead of being invalidated when each
+        ``asyncio.run()``-created loop is destroyed.
+        """
+        if self._run_now_loop is None or self._run_now_loop.is_closed():
+            self._run_now_loop = asyncio.new_event_loop()
+            logger.debug("[Scheduler] Created persistent run_now event loop.")
+        return self._run_now_loop
+
+    # ----------------------------------------------------------
     def run_now(self, job_id: str = "daily_summary"):
         """
-        Manually trigger a job by id (for testing / CLI flags).
+        Manually trigger a single job by id.
 
-        Sync jobs are called directly; async jobs are run via
-        ``asyncio.run()`` so this method is always safe to call from a
-        plain synchronous context (e.g. the ``main.py`` entrypoint).
+        All async jobs share a single persistent event loop (see
+        :meth:`_get_run_loop`) so that ``httpx.AsyncClient`` and other async
+        resources inside the notifier / LLM clients are NOT re-created and
+        re-bound on every call.  Calling ``asyncio.run()`` for each job would
+        create and destroy a new loop each time, leaving those clients bound
+        to a closed loop and causing ``RuntimeError: Event loop is closed`` on
+        the second and subsequent async jobs.
+
+        Call :meth:`close_run_loop` when all ``run_now`` calls are finished
+        to release the loop and its resources cleanly.
         """
         job_map = {
             "daily_summary":   self._run_daily_summary,
@@ -329,6 +362,23 @@ class AutomationScheduler:
         if fn is None:
             raise ValueError(f"Unknown job id: {job_id!r}. Choose from {list(job_map)}")
         if asyncio.iscoroutinefunction(fn):
-            asyncio.run(fn())
+            self._get_run_loop().run_until_complete(fn())   # reuse the same loop
         else:
             fn()
+
+    # ----------------------------------------------------------
+    def close_run_loop(self):
+        """
+        Shut down the persistent event loop used by :meth:`run_now`.
+
+        Call this once after all ``run_now()`` calls are complete
+        (e.g. at the end of a ``--run-now`` or ``--check-eta`` CLI run)
+        to close open connections and release resources.
+        """
+        if self._run_now_loop and not self._run_now_loop.is_closed():
+            self._run_now_loop.run_until_complete(
+                self._run_now_loop.shutdown_asyncgens()
+            )
+            self._run_now_loop.close()
+            logger.debug("[Scheduler] Persistent run_now event loop closed.")
+        self._run_now_loop = None
