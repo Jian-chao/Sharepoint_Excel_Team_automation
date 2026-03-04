@@ -252,15 +252,24 @@ class AutomationScheduler:
 
     # ----------------------------------------------------------
     async def _run_overdue_tracker(self):
+        """
+        Overdue tracker (async, batched):
+          - Collects every overdue (subsys, field) pair across all records.
+          - Groups them by owner (rec.be) so ONE Teams message is sent per
+            person instead of one per (subsys, field).
+          - Delegates to notifier.send_overdue_batch() which builds an HTML
+            table, keeping total API calls well below the 10/10s quota.
+        """
         logger.info("[Scheduler] ▶ Running: overdue_tracker")
         try:
             records, splunk_data = self._fetch_data()
             today    = date.today()
             deadline = _DEADLINE
 
+            # Gather ALL overdue items first, grouped by owner
+            grouped: dict[str, list[dict]] = {}
             for rec in records:
                 sp = splunk_data.get(rec.subsys, {})
-                # Check each user-fill deliverable
                 fields_and_excel = {
                     "ppt":     rec.ppt_status,
                     "netlist": rec.netlist,
@@ -275,8 +284,27 @@ class AutomationScheduler:
                         or splunk_ok is True
                     )
                     if not uploaded and today > deadline:
-                        logger.warning(f"[Scheduler] OVERDUE: {rec.subsys}/{field}")
-                        await self.notifier.send_overdue_alert(rec, field)
+                        owner = rec.be or rec.fe or "Unknown"
+                        grouped.setdefault(owner, []).append({
+                            "subsys": rec.subsys,
+                            "field":  field,
+                            "fe":     rec.fe or "",
+                            "bc":     rec.bc or "",
+                        })
+                        logger.warning(
+                            f"[Scheduler] OVERDUE: {rec.subsys}/{field} → {owner}"
+                        )
+
+            if grouped:
+                total = sum(len(v) for v in grouped.values())
+                logger.info(
+                    f"[Scheduler] overdue_tracker: {total} overdue item(s) across "
+                    f"{len(grouped)} owner(s) — sending batch notification(s)."
+                )
+                # ONE Teams message per owner (table with all their items)
+                await self.notifier.send_overdue_batch(grouped)
+            else:
+                logger.info("[Scheduler] ✅ overdue_tracker: no overdue items.")
         except Exception as exc:
             logger.error(f"[Scheduler] ❌ overdue_tracker failed: {exc}", exc_info=True)
 

@@ -211,6 +211,9 @@ class ETAChecker:
             (blank, needs correction, or couldn't be parsed).
         """
         report = []
+        # Collect blank fields grouped by owner; batch-dispatched at the end
+        # so ONE message per person is sent instead of one per (subsys, field).
+        blank_nudge_grouped: dict[str, list[dict]] = {}
 
         # ── Step 1: handle non-ppt upload-flag fields synchronously ──────────
         #   These never need LLM calls — process them up-front.
@@ -228,7 +231,13 @@ class ETAChecker:
                     continue
                 if not raw_val or raw_val.strip() == "":
                     if nudge_blank and self._notifier:
-                        await self._send_blank_nudge(rec, fld)
+                        owner = rec.be or rec.fe or "Unknown"
+                        blank_nudge_grouped.setdefault(owner, []).append({
+                            "subsys": rec.subsys,
+                            "field":  fld,
+                            "fe":     rec.fe or "",
+                            "bc":     rec.bc or "",
+                        })
                     report.append({
                         "subsys": rec.subsys,
                         "field":  fld,
@@ -240,6 +249,8 @@ class ETAChecker:
         #   Build the task list first, keeping track of which record each
         #   task belongs to, then gather them all in one shot.
         if "ppt_status" not in fields:
+            # No ppt_status to process — dispatch any collected blanks and return
+            await self._dispatch_blank_eta_batch(blank_nudge_grouped)
             return report
 
         ppt_records = [
@@ -276,7 +287,13 @@ class ETAChecker:
 
             if result.is_blank:
                 if nudge_blank and self._notifier:
-                    await self._send_blank_nudge(rec, "ppt_status")
+                    owner = rec.be or rec.fe or "Unknown"
+                    blank_nudge_grouped.setdefault(owner, []).append({
+                        "subsys": rec.subsys,
+                        "field":  "ppt_status",
+                        "fe":     rec.fe or "",
+                        "bc":     rec.bc or "",
+                    })
                 entry["status"] = "blank"
                 report.append(entry)
                 continue
@@ -303,6 +320,11 @@ class ETAChecker:
                     f"[ETAChecker] OVERDUE ETA: {rec.subsys}/ppt_status "
                     f"was {result.iso} ({abs(result.days_until)}d ago)"
                 )
+
+        # ── Step 4: batch-send all collected blank-ETA nudges ─────────────────
+        #   ONE Teams message per owner, regardless of how many subsys/fields
+        #   they are responsible for — avoids Graph API 429 TooManyRequests.
+        await self._dispatch_blank_eta_batch(blank_nudge_grouped)
 
         return report
 
@@ -408,6 +430,41 @@ Do NOT include any explanation outside the JSON object."""
             )
             return corrected, True
         return d, False
+
+    async def _dispatch_blank_eta_batch(
+        self,
+        grouped: dict,   # {owner: [{"subsys", "field", "fe", "bc"}, ...]}
+    ) -> None:
+        """
+        Send ONE Teams message per owner covering all their blank ETA fields.
+
+        Delegates to ``notifier.send_blank_eta_batch`` (preferred: single
+        message per person, built-in rate-limiting) with a log-only fallback
+        if the notifier does not expose that method.
+        """
+        if not grouped or not self._notifier:
+            return
+        if hasattr(self._notifier, "send_blank_eta_batch"):
+            try:
+                total = sum(len(v) for v in grouped.values())
+                logger.info(
+                    f"[ETAChecker] Sending blank-ETA batch: {total} item(s) "
+                    f"across {len(grouped)} owner(s)."
+                )
+                await self._notifier.send_blank_eta_batch(grouped)
+                return
+            except Exception as exc:
+                logger.warning(
+                    f"[ETAChecker] send_blank_eta_batch failed: {exc}"
+                )
+        # Fallback: log only (avoids per-item API calls as safety net)
+        for owner, items in grouped.items():
+            for it in items:
+                logger.info(
+                    f"[ETAChecker] (fallback) Blank ETA: "
+                    f"{it['subsys']}/{it['field']} → {owner}"
+                )
+
 
     async def _send_blank_nudge(self, rec, field: str):
         """

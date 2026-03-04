@@ -38,7 +38,9 @@ Required env vars for RemoteTeamsNotifier (set on remote machine):
 Search "--- REMOTE ONLY ---" to find every placeholder.
 """
 
+import asyncio
 import logging
+import time
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 import certifi
@@ -148,7 +150,7 @@ def _build_summary_html(records: list[SubsysRecord], splunk_data: dict) -> str:
     {rows_html}
   </tbody>
 </table>
-<p><i>Legend: ✅ Done | ❌ Missing | ⏳ ETA | 🔴 Overdue | ➖ N/A | ❓ No Splunk data</i></p>
+<p><i>Legend: ✅ Done | ❌ Missing | ⏳ ETA | 🔴 Overdue | ➖ N/A | ❓ No data uploaded</i></p>
 """
     return html.strip()
 
@@ -186,6 +188,68 @@ def _build_blank_eta_nudge_html(rec: SubsysRecord, field: str) -> str:
     )
 
 
+def _build_overdue_batch_html(owner: str, items: list) -> str:
+    """
+    Build **one** HTML message covering all overdue deliverables for *owner*.
+
+    items : list of {"subsys": str, "field": str, "fe": str, "bc": str}
+    """
+    rows = "".join(
+        f"<tr>"
+        f"<td><b>{it['subsys']}</b></td>"
+        f"<td><b>{it['field'].upper()}</b></td>"
+        f"<td>{it['fe']}</td>"
+        f"<td>{it['bc']}</td>"
+        f"</tr>"
+        for it in items
+    )
+    today_str = date.today().strftime("%Y-%m-%d")
+    return (
+        f"<p>🔴 <b>Overdue Deliverables — {today_str}</b><br>"
+        f"Hi <b>{owner}</b>, the following items have passed their deadline "
+        f"and are blocking downstream work. "
+        f"Please provide updated ETAs immediately.</p>"
+        f"<table border='1' cellpadding='4' cellspacing='0'>"
+        f"<thead><tr>"
+        f"<th>Subsys</th><th>Deliverable</th><th>FE</th><th>BC</th>"
+        f"</tr></thead>"
+        f"<tbody>{rows}</tbody>"
+        f"</table>"
+        f"<p><i>Total: {len(items)} overdue item(s)</i></p>"
+    )
+
+
+def _build_blank_eta_batch_html(owner: str, items: list) -> str:
+    """
+    Build **one** HTML message listing all blank ETA / upload fields for *owner*.
+
+    items : list of {"subsys": str, "field": str, "fe": str, "bc": str}
+    """
+    rows = "".join(
+        f"<tr>"
+        f"<td><b>{it['subsys']}</b></td>"
+        f"<td><b>{it['field'].replace('_status','').upper()}</b></td>"
+        f"<td>{it['fe']}</td>"
+        f"<td>{it['bc']}</td>"
+        f"</tr>"
+        for it in items
+    )
+    today_str = date.today().strftime("%Y-%m-%d")
+    return (
+        f"<p>📅 <b>ETA Required — {today_str}</b><br>"
+        f"Hi <b>{owner}</b>, the following deliverable fields are currently "
+        f"blank in the tracker. Please reply with your expected upload date "
+        f"for each item below. 🙏</p>"
+        f"<table border='1' cellpadding='4' cellspacing='0'>"
+        f"<thead><tr>"
+        f"<th>Subsys</th><th>Deliverable</th><th>FE</th><th>BC</th>"
+        f"</tr></thead>"
+        f"<tbody>{rows}</tbody>"
+        f"</table>"
+        f"<p><i>Total: {len(items)} field(s) need your ETA</i></p>"
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # MOCK notifier  (all methods are async for interface parity)
 # ─────────────────────────────────────────────────────────────
@@ -215,13 +279,40 @@ class MockTeamsNotifier:
         await self.post_to_chat(html)
 
     async def send_overdue_alert(self, rec: SubsysRecord, field: str):
+        """Send a single overdue alert (kept for backward-compat; prefer send_overdue_batch)."""
         html = _build_overdue_html(rec, field)
         await self.post_to_chat(html)
 
     async def send_blank_eta_nudge(self, rec: SubsysRecord, field: str):
-        """Nudge the owner to fill in their ETA for a blank field."""
+        """Nudge the owner to fill in their ETA (kept for backward-compat; prefer send_blank_eta_batch)."""
         html = _build_blank_eta_nudge_html(rec, field)
         await self.post_to_chat(html)
+
+    async def send_overdue_batch(
+        self,
+        grouped: dict,
+        chat_id: str = "MOCK",
+    ):
+        """
+        Send one mock message per owner covering all their overdue items.
+        grouped : {owner: [{"subsys", "field", "fe", "bc"}, ...]}
+        """
+        for owner, items in grouped.items():
+            html = _build_overdue_batch_html(owner, items)
+            await self.post_to_chat(html, chat_id)
+
+    async def send_blank_eta_batch(
+        self,
+        grouped: dict,
+        chat_id: str = "MOCK",
+    ):
+        """
+        Send one mock message per owner listing all their blank ETA fields.
+        grouped : {owner: [{"subsys", "field", "fe", "bc"}, ...]}
+        """
+        for owner, items in grouped.items():
+            html = _build_blank_eta_batch_html(owner, items)
+            await self.post_to_chat(html, chat_id)
 
     async def poll_chat_messages(
         self,
@@ -392,7 +483,13 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
             credentials = credential,
             scopes      = config.TEAMS_SCOPES,
         )
-        self._default_chat = config.TEAMS_CHAT_ID
+        self._default_chat   = config.TEAMS_CHAT_ID
+
+        # Rate-limiter state — Graph API enforces 10 messages / 10 seconds.
+        # Sleeping at least _min_interval seconds between posts keeps us safely
+        # under that threshold without any retry logic.
+        self._last_post_time: float = 0.0
+        self._min_interval:   float = 1.1   # seconds  → max ≈ 9 posts / 10s
 
     # ----------------------------------------------------------
     async def post_to_chat(                                    # --- REMOTE ONLY ---
@@ -428,9 +525,20 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
 
         chat_id = chat_id or self._default_chat
 
+        # --- Rate limiter ---------------------------------------------------
+        # Enforce >= _min_interval seconds between consecutive Graph API posts
+        # to stay below the 10-per-10-seconds quota.
+        elapsed = time.monotonic() - self._last_post_time
+        if elapsed < self._min_interval:
+            wait = self._min_interval - elapsed
+            logger.debug(f"[Teams] Rate-limiting: sleeping {wait:.2f}s before post.")
+            await asyncio.sleep(wait)
+        self._last_post_time = time.monotonic()
+        # --------------------------------------------------------------------
+
         # Build request body using msgraph model classes
-        request_body            = ChatMessage()
-        request_body.body       = ItemBody()
+        request_body                   = ChatMessage()
+        request_body.body              = ItemBody()
         request_body.body.content_type = BodyType.Html
         request_body.body.content      = html_body
 
@@ -466,6 +574,7 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
         field:   str,
         chat_id: Optional[str] = None,
     ):
+        """Single overdue alert (kept for backward-compat; prefer send_overdue_batch)."""
         html = _build_overdue_html(rec, field)
         return await self.post_to_chat(html, chat_id)
 
@@ -475,9 +584,47 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
         field:   str,
         chat_id: Optional[str] = None,
     ):
-        """Nudge the owner to fill in their ETA for a blank upload field."""
+        """Single blank-ETA nudge (kept for backward-compat; prefer send_blank_eta_batch)."""
         html = _build_blank_eta_nudge_html(rec, field)
         return await self.post_to_chat(html, chat_id)
+
+    async def send_overdue_batch(                              # --- REMOTE ONLY ---
+        self,
+        grouped:  dict,
+        chat_id:  Optional[str] = None,
+    ):
+        """
+        Send **one** Teams message per owner with a table of all their overdue items.
+        The built-in rate-limiter in :meth:`post_to_chat` ensures we stay
+        below the 10/10s Graph API quota automatically.
+
+        grouped : {owner_name: [{"subsys", "field", "fe", "bc"}, ...]}
+        """
+        for owner, items in grouped.items():
+            html = _build_overdue_batch_html(owner, items)
+            await self.post_to_chat(html, chat_id)
+            logger.info(
+                f"[Teams] Overdue batch → {owner!r} ({len(items)} item(s))."
+            )
+
+    async def send_blank_eta_batch(                            # --- REMOTE ONLY ---
+        self,
+        grouped:  dict,
+        chat_id:  Optional[str] = None,
+    ):
+        """
+        Send **one** Teams message per owner listing all their blank ETA fields.
+        The built-in rate-limiter in :meth:`post_to_chat` ensures we stay
+        below the 10/10s Graph API quota automatically.
+
+        grouped : {owner_name: [{"subsys", "field", "fe", "bc"}, ...]}
+        """
+        for owner, items in grouped.items():
+            html = _build_blank_eta_batch_html(owner, items)
+            await self.post_to_chat(html, chat_id)
+            logger.info(
+                f"[Teams] Blank-ETA batch → {owner!r} ({len(items)} field(s))."
+            )
 
     # ----------------------------------------------------------
     async def poll_chat_messages(                              # --- REMOTE ONLY ---
