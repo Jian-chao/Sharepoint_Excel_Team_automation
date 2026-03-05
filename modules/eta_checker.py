@@ -211,63 +211,65 @@ class ETAChecker:
             (blank, needs correction, or couldn't be parsed).
         """
         report = []
-        # Collect blank fields grouped by owner; batch-dispatched at the end
-        # so ONE message per person is sent instead of one per (subsys, field).
-        blank_nudge_grouped: dict[str, list[dict]] = {}
+        # 2-D nudge: {owner: {subsys: {field: eta_str}}}
+        blank_nudge_grouped: dict[str, dict[str, dict]] = {}
 
-        # ── Step 1: handle non-ppt upload-flag fields synchronously ──────────
-        #   These never need LLM calls — process them up-front.
+        # Build the FE-owned field set from config (normalised, no "_status" suffix)
+        _fe_fields = {
+            f.lower().replace("_status", "")
+            for f in getattr(config, "FE_OWNED_FIELDS", ["ppt", "ppt_status"])
+        }
+
+        def _owner(rec, field: str) -> str:
+            """Return the responsible owner name based on config.FE_OWNED_FIELDS."""
+            norm = field.lower().replace("_status", "")
+            return (rec.fe if norm in _fe_fields else rec.be) or rec.fe or rec.be or "Unknown"
+
+        def _add_nudge(owner: str, subsys: str, field: str, eta_str: str):
+            blank_nudge_grouped.setdefault(owner, {}).setdefault(subsys, {})[field] = eta_str
+
+        # ── Pass 1: classify every (rec, field) ─────────────────────────────────
+        #   delivered → skip   |   blank → yellow cell, no LLM
+        #   non-blank → queue for concurrent LLM / regex parse (Pass 2)
+        to_parse: list = []   # [(rec, field, cleaned_raw)]
+
         for rec in records:
             sp = splunk_data.get(rec.subsys, {})
             for fld in fields:
-                if fld == "ppt_status":
-                    continue  # handled below
-                raw_val = getattr(rec, fld, "") or ""
-                uploaded = (
-                    raw_val.lower() in ("v", "done", "x")
-                    or sp.get(fld) is True
+                raw    = (getattr(rec, fld, "") or "").strip()
+                sp_key = fld.replace("_status", "")
+                done   = (
+                    raw.lower() in ("v", "done", "x")
+                    or sp.get(sp_key) is True
                 )
-                if uploaded:
+                if done:
                     continue
-                if not raw_val or raw_val.strip() == "":
+
+                if not raw:
+                    # Blank field — yellow cell, no LLM needed
                     if nudge_blank and self._notifier:
-                        owner = rec.be or rec.fe or "Unknown"
-                        blank_nudge_grouped.setdefault(owner, []).append({
-                            "subsys": rec.subsys,
-                            "field":  fld,
-                            "fe":     rec.fe or "",
-                            "bc":     rec.bc or "",
+                        _add_nudge(_owner(rec, fld), rec.subsys, fld, "")
+                    if fld != "ppt_status":
+                        report.append({
+                            "subsys": rec.subsys, "field": fld,
+                            "status": "blank",    "owner": _owner(rec, fld),
                         })
-                    report.append({
-                        "subsys": rec.subsys,
-                        "field":  fld,
-                        "status": "blank",
-                        "owner":  rec.be,
-                    })
+                else:
+                    # Non-blank, non-delivered → send all formats to LLM/regex.
+                    # Handles: "3/2->3/4", "Mar/4th", "3/4(3/2)", "03.04", etc.
+                    cleaned = raw.replace("eta:", "").strip()
+                    to_parse.append((rec, fld, cleaned))
 
-        # ── Step 2: fan out ALL ppt_status parse_eta calls concurrently ──────
-        #   Build the task list first, keeping track of which record each
-        #   task belongs to, then gather them all in one shot.
-        if "ppt_status" not in fields:
-            # No ppt_status to process — dispatch any collected blanks and return
-            await self._dispatch_blank_eta_batch(blank_nudge_grouped)
-            return report
-
-        ppt_records = [
-            (rec, getattr(rec, "ppt_status", "") or "")
-            for rec in records
-        ]
-
-        # asyncio.gather fires all coroutines; return_exceptions prevents one
-        # failed LLM call from aborting the rest.
-        eta_results: list[ETAResult | BaseException] = await asyncio.gather(
-            *[self.parse_eta(raw) for _, raw in ppt_records],
+        # ── Pass 2: fan-out ALL parse_eta coroutines concurrently ───────────────
+        #   Covers ppt_status, netlist, sdc, ccf, upf uniformly — the LLM
+        #   resolves complex DE date shorthand for every deliverable type.
+        eta_results: list = await asyncio.gather(
+            *[self.parse_eta(cleaned) for _, _, cleaned in to_parse],
             return_exceptions=True,
         )
 
-        # ── Step 3: process gathered results ─────────────────────────────────
-        for (rec, raw_val), result in zip(ppt_records, eta_results):
-            # Wrap unexpected exceptions in a failed ETAResult
+        # ── Pass 3: process gathered results ────────────────────────────────────
+        for (rec, fld, raw_val), result in zip(to_parse, eta_results):
             if isinstance(result, BaseException):
                 result = ETAResult(
                     raw=raw_val, parsed=None,
@@ -276,9 +278,9 @@ class ETAChecker:
 
             entry = {
                 "subsys":     rec.subsys,
-                "field":      "ppt_status",
+                "field":      fld,
                 "raw":        raw_val,
-                "owner":      rec.be,
+                "owner":      _owner(rec, fld),
                 "eta_result": result,
             }
 
@@ -287,46 +289,42 @@ class ETAChecker:
 
             if result.is_blank:
                 if nudge_blank and self._notifier:
-                    owner = rec.be or rec.fe or "Unknown"
-                    blank_nudge_grouped.setdefault(owner, []).append({
-                        "subsys": rec.subsys,
-                        "field":  "ppt_status",
-                        "fe":     rec.fe or "",
-                        "bc":     rec.bc or "",
-                    })
+                    _add_nudge(_owner(rec, fld), rec.subsys, fld, "")
                 entry["status"] = "blank"
                 report.append(entry)
                 continue
 
             if result.parse_error:
                 logger.warning(
-                    f"[ETAChecker] Could not parse ETA for "
-                    f"{rec.subsys}/ppt_status: {raw_val!r} → {result.parse_error}"
+                    f"[ETAChecker] Cannot parse ETA for "
+                    f"{rec.subsys}/{fld}: {raw_val!r} → {result.parse_error}"
                 )
                 entry["status"] = "parse_error"
                 report.append(entry)
                 continue
 
+            # Valid parsed ETA — white cell (date shown) in ETA-Required table
+            if nudge_blank and self._notifier and result.iso:
+                _add_nudge(_owner(rec, fld), rec.subsys, fld, result.iso)
+
             if result.corrected:
                 logger.warning(
-                    f"[ETAChecker] Year-flip correction applied for "
-                    f"{rec.subsys}/ppt_status: {raw_val!r} → {result.iso}"
+                    f"[ETAChecker] Year-flip: {rec.subsys}/{fld} "
+                    f"{raw_val!r} → {result.iso}"
                 )
                 entry["status"] = "year_corrected"
                 report.append(entry)
 
             if result.days_until is not None and result.days_until < 0:
                 logger.warning(
-                    f"[ETAChecker] OVERDUE ETA: {rec.subsys}/ppt_status "
+                    f"[ETAChecker] OVERDUE ETA: {rec.subsys}/{fld} "
                     f"was {result.iso} ({abs(result.days_until)}d ago)"
                 )
 
-        # ── Step 4: batch-send all collected blank-ETA nudges ─────────────────
-        #   ONE Teams message per owner, regardless of how many subsys/fields
-        #   they are responsible for — avoids Graph API 429 TooManyRequests.
+        # ── Pass 4: batch-send ETA nudges (one message per owner) ───────────────
         await self._dispatch_blank_eta_batch(blank_nudge_grouped)
-
         return report
+
 
     # ----------------------------------------------------------
     # Internal helpers

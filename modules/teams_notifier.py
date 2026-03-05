@@ -188,65 +188,139 @@ def _build_blank_eta_nudge_html(rec: SubsysRecord, field: str) -> str:
     )
 
 
-def _build_overdue_batch_html(owner: str, items: list) -> str:
-    """
-    Build **one** HTML message covering all overdue deliverables for *owner*.
+# Field display order in all 2-D tables
+_FIELD_ORDER = ["ppt", "netlist", "sdc", "ccf", "upf"]
 
-    items : list of {"subsys": str, "field": str, "fe": str, "bc": str}
+# CSS column widths per deliverable in the 2-D tables
+_TH_STYLE  = "padding:5px 8px;border:1px solid #888;white-space:nowrap;"
+_TD_STYLE  = "padding:4px 6px;border:1px solid #888;"
+_HDR_STYLE = _TH_STYLE + "background:#333;color:#FFF;font-weight:bold;"
+
+
+def _overdue_cell_color(days: int) -> tuple[str, str]:
     """
-    rows = "".join(
-        f"<tr>"
-        f"<td><b>{it['subsys']}</b></td>"
-        f"<td><b>{it['field'].upper()}</b></td>"
-        f"<td>{it['fe']}</td>"
-        f"<td>{it['bc']}</td>"
-        f"</tr>"
-        for it in items
-    )
+    Map days-overdue → (background_color, text_color) for the overdue table.
+    Gradient runs light-pink → dark-maroon; text flips to white above day 3.
+    """
+    if days <= 1:  return "#FFCCCC", "#000000"
+    if days <= 3:  return "#FF9999", "#000000"
+    if days <= 7:  return "#FF4444", "#FFFFFF"
+    if days <= 14: return "#CC0000", "#FFFFFF"
+    return             "#800000", "#FFFFFF"
+
+
+def _build_overdue_batch_html(owner: str, subsys_map: dict) -> str:
+    """
+    2-D overdue table:  rows=subsys, columns=deliverable fields.
+
+    subsys_map : {subsys: {field: {"eta":str, "days_overdue":int, "delivered":bool}}}
+
+    - Delivered field  → green cell (✅)
+    - Overdue  field   → red gradient cell with ETA date (deeper red = more overdue)
+    """
+    seen = {f for fd in subsys_map.values() for f in fd}
+    fields = [f for f in _FIELD_ORDER if f in seen]
     today_str = date.today().strftime("%Y-%m-%d")
+
+    col_hdrs = "".join(
+        f'<th style="{_HDR_STYLE}">{f.upper()}</th>' for f in fields
+    )
+    header = (
+        f'<tr><td colspan="{len(fields)+1}" '
+        f'style="{_TH_STYLE}background:#111;color:#FFF;font-size:1.05em;">'
+        f'🔴 Overdue Deliverables — {today_str} &nbsp;|  Owner: <b>{owner}</b>'
+        f'</td></tr>'
+        f'<tr><th style="{_HDR_STYLE}">Subsys</th>{col_hdrs}</tr>'
+    )
+
+    rows = ""
+    for subsys, fd in subsys_map.items():
+        cells = "".join(
+            (
+                f'<td style="{_TD_STYLE}background:#22BB22;color:#FFF;'
+                f'text-align:center;">✅</td>'
+                if fd.get(f, {}).get("delivered")
+                else (
+                    "".join([
+                        f'<td style="{_TD_STYLE}'
+                        f'background:{_overdue_cell_color(fd[f]["days_overdue"])[0]};'
+                        f'color:{_overdue_cell_color(fd[f]["days_overdue"])[1]};'
+                        f'font-weight:bold;text-align:center;">'
+                        f'{fd[f]["eta"]}</td>'
+                    ]) if f in fd
+                    else f'<td style="{_TD_STYLE}"></td>'
+                )
+            )
+            for f in fields
+        )
+        rows += f'<tr><td style="{_TD_STYLE}font-weight:bold;">{subsys}</td>{cells}</tr>'
+
+    guide = (
+        "<p><i>Colour: "
+        "<span style='background:#FFCCCC;padding:1px 4px;'>1d</span> "
+        "<span style='background:#FF9999;padding:1px 4px;'>3d</span> "
+        "<span style='background:#FF4444;color:#FFF;padding:1px 4px;'>7d</span> "
+        "<span style='background:#CC0000;color:#FFF;padding:1px 4px;'>14d</span> "
+        "<span style='background:#800000;color:#FFF;padding:1px 4px;'>14d+</span> "
+        "overdue</i></p>"
+    )
     return (
-        f"<p>🔴 <b>Overdue Deliverables — {today_str}</b><br>"
-        f"Hi <b>{owner}</b>, the following items have passed their deadline "
-        f"and are blocking downstream work. "
-        f"Please provide updated ETAs immediately.</p>"
-        f"<table border='1' cellpadding='4' cellspacing='0'>"
-        f"<thead><tr>"
-        f"<th>Subsys</th><th>Deliverable</th><th>FE</th><th>BC</th>"
-        f"</tr></thead>"
-        f"<tbody>{rows}</tbody>"
-        f"</table>"
-        f"<p><i>Total: {len(items)} overdue item(s)</i></p>"
+        f'<table cellpadding="0" cellspacing="0" '
+        f'style="border-collapse:collapse;font-family:Arial,sans-serif;">'
+        f'<thead>{header}</thead>'
+        f'<tbody>{rows}</tbody>'
+        f'</table>{guide}'
     )
 
 
-def _build_blank_eta_batch_html(owner: str, items: list) -> str:
+def _build_blank_eta_batch_html(owner: str, subsys_map: dict) -> str:
     """
-    Build **one** HTML message listing all blank ETA / upload fields for *owner*.
+    2-D ETA-Required table:  rows=subsys, columns=deliverable fields.
 
-    items : list of {"subsys": str, "field": str, "fe": str, "bc": str}
+    subsys_map : {subsys: {field: str}}
+      field value = ""           → blank   → yellow cell (ETA missing)
+      field value = "2026/3/2"   → has ETA → plain white cell  showing the date
+
+    Fields missing from a subsys dict are skipped (field not applicable).
     """
-    rows = "".join(
-        f"<tr>"
-        f"<td><b>{it['subsys']}</b></td>"
-        f"<td><b>{it['field'].replace('_status','').upper()}</b></td>"
-        f"<td>{it['fe']}</td>"
-        f"<td>{it['bc']}</td>"
-        f"</tr>"
-        for it in items
-    )
+    seen = {f for fd in subsys_map.values() for f in fd}
+    fields = [f for f in _FIELD_ORDER if f in seen]
     today_str = date.today().strftime("%Y-%m-%d")
+
+    col_hdrs = "".join(
+        f'<th style="{_TH_STYLE}">{f.upper()}</th>' for f in fields
+    )
+    header = (
+        f'<tr><td colspan="{len(fields)+1}" '
+        f'style="{_TH_STYLE}font-weight:bold;">'
+        f'Owner: <b>{owner}</b>'
+        f'</td></tr>'
+        f'<tr><th style="{_TH_STYLE}">ETA required</th>{col_hdrs}</tr>'
+    )
+
+    rows = ""
+    for subsys, fd in subsys_map.items():
+        cells = "".join(
+            (
+                f'<td style="{_TD_STYLE}background:#FFD700;"></td>'
+                if fd.get(f, None) == ""
+                else (
+                    f'<td style="{_TD_STYLE}">{fd[f]}</td>'
+                    if f in fd
+                    else f'<td style="{_TD_STYLE}"></td>'
+                )
+            )
+            for f in fields
+        )
+        rows += f'<tr><td style="{_TD_STYLE}font-weight:bold;">{subsys}</td>{cells}</tr>'
+
     return (
-        f"<p>📅 <b>ETA Required — {today_str}</b><br>"
-        f"Hi <b>{owner}</b>, the following deliverable fields are currently "
-        f"blank in the tracker. Please reply with your expected upload date "
-        f"for each item below. 🙏</p>"
-        f"<table border='1' cellpadding='4' cellspacing='0'>"
-        f"<thead><tr>"
-        f"<th>Subsys</th><th>Deliverable</th><th>FE</th><th>BC</th>"
-        f"</tr></thead>"
-        f"<tbody>{rows}</tbody>"
-        f"</table>"
-        f"<p><i>Total: {len(items)} field(s) need your ETA</i></p>"
+        f'<table cellpadding="0" cellspacing="0" '
+        f'style="border-collapse:collapse;font-family:Arial,sans-serif;">'
+        f'<thead>{header}</thead>'
+        f'<tbody>{rows}</tbody>'
+        f'</table>'
+        f'<p><i>🟡 Yellow = ETA missing &nbsp; White = ETA already provided</i></p>'
     )
 
 

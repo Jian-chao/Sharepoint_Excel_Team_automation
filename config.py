@@ -89,3 +89,16 @@ USE_MOCK_TEAMS       = True
 DAILY_SUMMARY_TIME   = os.environ.get("DAILY_SUMMARY_TIME",  "09:00")   # e.g. "09:00", "14:30"
 REMINDER_LEAD_DAYS   = int(os.environ.get("REMINDER_LEAD_DAYS", "1"))    # notify N days before ETA deadline
 TIMEZONE             = os.environ.get("TZ", "Asia/Taipei")               # APScheduler timezone
+
+# ============================================================
+# Deliverable → owner mapping
+# ============================================================
+# Fields listed here are considered the responsibility of the Frontend Engineer (FE).
+# All other tracked fields (netlist, sdc, ccf, upf) default to the BE owner.
+# Modify this list to reassign ownership without touching module code.
+FE_OWNED_FIELDS: list = ["ppt", "ppt_status"]
+
+# Default deadline used when a deliverable has no custom ETA in the Excel sheet.
+# Format: (YYYY, MM, DD)
+from datetime import date as _date
+DEFAULT_ETA: _date = _date(2026, 2, 26)

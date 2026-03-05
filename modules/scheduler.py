@@ -253,60 +253,122 @@ class AutomationScheduler:
     # ----------------------------------------------------------
     async def _run_overdue_tracker(self):
         """
-        Overdue tracker (async, batched):
-          - Collects every overdue (subsys, field) pair across all records.
-          - Groups them by owner (rec.be) so ONE Teams message is sent per
-            person instead of one per (subsys, field).
-          - Delegates to notifier.send_overdue_batch() which builds an HTML
-            table, keeping total API calls well below the 10/10s quota.
+        Overdue tracker — 2-D batch notifications:
+          • PPT deliverable → owner is FE (rec.fe)
+          • NETLIST/SDC/CCF/UPF → owner is BE (rec.be)
+          • ONE Teams message per owner, with a 2-D table:
+              rows = subsys, columns = deliverable fields
+          • Delivered field → green cell
+          • Overdue field   → red gradient cell (light→dark based on days overdue)
+          • ETA per field: custom date from Excel value, or _DEADLINE if blank
         """
         logger.info("[Scheduler] ▶ Running: overdue_tracker")
         try:
             records, splunk_data = self._fetch_data()
-            today    = date.today()
-            deadline = _DEADLINE
+            today            = date.today()
+            default_deadline = getattr(config, "DEFAULT_ETA", _DEADLINE)
 
-            # Gather ALL overdue items first, grouped by owner
-            grouped: dict[str, list[dict]] = {}
+            # FE-owned fields (normalised, no "_status" suffix)
+            _fe_fields = {
+                x.lower().replace("_status", "")
+                for x in getattr(config, "FE_OWNED_FIELDS", ["ppt", "ppt_status"])
+            }
+
+            def _owner(rec, field: str) -> str:
+                norm = field.lower().replace("_status", "")
+                return (rec.fe if norm in _fe_fields else rec.be) or rec.fe or rec.be or "Unknown"
+
+            # {owner: {subsys: {field: {"eta":str,"days_overdue":int,"delivered":bool}}}}
+            grouped: dict[str, dict[str, dict]] = {}
+
             for rec in records:
-                sp = splunk_data.get(rec.subsys, {})
-                fields_and_excel = {
+                sp             = splunk_data.get(rec.subsys, {})
+                fields_and_raw = {
                     "ppt":     rec.ppt_status,
                     "netlist": rec.netlist,
                     "sdc":     rec.sdc,
                     "ccf":     rec.ccf,
                     "upf":     rec.upf,
                 }
-                for field, excel_val in fields_and_excel.items():
+
+                # ── Pass A: split fields into delivered / blank / parse-needed ─
+                delivered_fields: dict[str, dict] = {}
+                to_parse: list  = []   # (field, cleaned_raw)
+                blank_fields: list = []  # field names with no ETA
+
+                for field, excel_val in fields_and_raw.items():
                     splunk_ok = sp.get(field)
-                    uploaded  = (
-                        (excel_val.lower() in ("v", "done", "x") if excel_val else False)
+                    done = (
+                        bool(excel_val and excel_val.lower() in ("v", "done", "x"))
                         or splunk_ok is True
                     )
-                    if not uploaded and today > deadline:
-                        owner = rec.be or rec.fe or "Unknown"
-                        grouped.setdefault(owner, []).append({
-                            "subsys": rec.subsys,
-                            "field":  field,
-                            "fe":     rec.fe or "",
-                            "bc":     rec.bc or "",
-                        })
-                        logger.warning(
-                            f"[Scheduler] OVERDUE: {rec.subsys}/{field} → {owner}"
-                        )
+                    if done:
+                        delivered_fields[field] = {"eta": "✅", "days_overdue": 0, "delivered": True}
+                        continue
+
+                    cleaned = (excel_val or "").replace("eta:", "").strip()
+                    if cleaned:
+                        to_parse.append((field, cleaned))
+                    else:
+                        blank_fields.append(field)
+
+                # ── Pass B: LLM / regex fan-out for non-blank non-delivered ────
+                field_info: dict[str, dict] = dict(delivered_fields)
+
+                if to_parse:
+                    parse_results = await asyncio.gather(
+                        *[self.eta_checker.parse_eta(c) for _, c in to_parse],
+                        return_exceptions=True,
+                    )
+                    for (field, _), res in zip(to_parse, parse_results):
+                        if isinstance(res, BaseException) or res is None or not getattr(res, "parsed", None):
+                            eta_date = default_deadline
+                        else:
+                            eta_date = res.parsed
+                        days_overdue = (today - eta_date).days
+                        if days_overdue > 0:
+                            field_info[field] = {
+                                "eta":          eta_date.strftime("%Y/%m/%d"),
+                                "days_overdue": days_overdue,
+                                "delivered":    False,
+                            }
+
+                # ── Pass C: blank ETA fields → use default deadline ───────────
+                for field in blank_fields:
+                    days_overdue = (today - default_deadline).days
+                    if days_overdue > 0:
+                        field_info[field] = {
+                            "eta":          default_deadline.strftime("%Y/%m/%d"),
+                            "days_overdue": days_overdue,
+                            "delivered":    False,
+                        }
+
+                has_overdue = any(
+                    not info["delivered"] for info in field_info.values()
+                )
+                if not has_overdue:
+                    continue
+
+                # ── Group by owner (config-driven) ────────────────────────────
+                for field, info in field_info.items():
+                    owner = _owner(rec, field)
+                    grouped.setdefault(owner, {}).setdefault(rec.subsys, {})[field] = info
+                    if not info["delivered"]:
+                        logger.warning(f"[Scheduler] OVERDUE: {rec.subsys}/{field} → {owner}")
 
             if grouped:
-                total = sum(len(v) for v in grouped.values())
+                total_items  = sum(len(fd) for sm in grouped.values() for fd in sm.values())
                 logger.info(
-                    f"[Scheduler] overdue_tracker: {total} overdue item(s) across "
+                    f"[Scheduler] overdue_tracker: {total_items} item(s) across "
                     f"{len(grouped)} owner(s) — sending batch notification(s)."
                 )
-                # ONE Teams message per owner (table with all their items)
                 await self.notifier.send_overdue_batch(grouped)
             else:
                 logger.info("[Scheduler] ✅ overdue_tracker: no overdue items.")
         except Exception as exc:
             logger.error(f"[Scheduler] ❌ overdue_tracker failed: {exc}", exc_info=True)
+
+
 
     # ----------------------------------------------------------
     async def _async_run(self):
