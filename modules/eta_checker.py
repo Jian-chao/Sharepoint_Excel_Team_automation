@@ -159,6 +159,11 @@ class ETAChecker:
         if parsed is None and self._llm is not None:
             parsed, err, llm_used = await self._llm_parse(raw, cleaned)
 
+        # _llm_parse returns err="done" when the model recognises a completion
+        # marker that the regex didn't catch (e.g. unusual "done" phrasing).
+        if parsed is None and err == "done":
+            return ETAResult(raw=raw, parsed=None, is_done=True, llm_used=llm_used)
+
         if parsed is None:
             return ETAResult(
                 raw=raw, parsed=None,
@@ -375,43 +380,48 @@ class ETAChecker:
         """
         Ask the LLM to normalise the date string.  **Must be awaited.**
 
-        Calls ``self._llm.simple_query`` which is itself an async coroutine,
-        so the event loop is free while waiting for Azure's response.
+        Passes only the raw ETA value to ``simple_query``; all role definition,
+        output-format rules, and few-shot examples now live in the system
+        prompt inside ``LLM_cls.simple_query`` (via ``ChatPromptTemplate``).
 
-        Returns (date | None, error_msg, llm_used=True).
+        Returns ``(date | None, error_msg, llm_used=True)``.
+
+        Special return behaviours
+        ------------------------
+        * ``{"date": "done"}``  — model recognised a completion marker (v, x …)
+          → returned as ``(None, "", True)`` with ``is_done`` flag propagated
+          via ``ETAResult`` by the caller.
+        * ``{"date": null}``    — model could not parse → ``(None, error, True)``
         """
-        today_str = self._today.isoformat()
-        prompt = f"""You are a date normaliser. Today is {today_str}.
-
-A designer filled in an ETA field in an Excel sheet with this text:
-  "{raw}"
-
-Your task:
-1. Identify the intended calendar date (ignore any "eta:" prefix).
-2. If the year is missing, assume {self._today.year} (bump to {self._today.year + 1} if the date has already passed by more than 60 days).
-3. Output ONLY a JSON object with a single key "date" containing the ISO 8601 date string (YYYY-MM-DD), for example:
-   {{"date": "{today_str}"}}
-4. If you cannot determine a valid date at all, output:
-   {{"date": null, "error": "reason"}}
-
-Do NOT include any explanation outside the JSON object."""
-
         try:
-            raw_reply = await self._llm.simple_query(prompt)   # ← non-blocking await
-            # Extract the JSON object from the reply (LLM may wrap in markdown fences)
+            raw_reply = await self._llm.simple_query(raw)   # ← raw value only
+
+            # The system prompt guarantees JSON-only output, but defensively
+            # extract the first {...} block in case any stray text slips through.
             json_match = re.search(r"\{.*?\}", raw_reply, re.DOTALL)
             if not json_match:
-                return None, f"LLM returned no JSON: {raw_reply[:120]}", True
+                return None, f"LLM returned no JSON: {raw_reply[:120]!r}", True
+
             payload = json.loads(json_match.group())
-            if payload.get("date") is None:
+            date_val = payload.get("date")
+
+            # Completion sentinel — model says the field means "done / N/A"
+            if isinstance(date_val, str) and date_val.lower() == "done":
+                return None, "done", True
+
+            # Null — model could not determine a valid date
+            if date_val is None:
                 return None, payload.get("error", "LLM returned null date"), True
-            parsed = date.fromisoformat(payload["date"])
+
+            parsed = date.fromisoformat(date_val)
             return parsed, "", True
+
         except json.JSONDecodeError as e:
             return None, f"LLM JSON parse error: {e}", True
         except Exception as e:
             logger.error(f"[ETAChecker] LLM call failed: {e}", exc_info=True)
             return None, f"LLM exception: {e}", True
+
 
     def _correct_year_flip(self, d: date, raw: str) -> tuple[date, bool]:
         """

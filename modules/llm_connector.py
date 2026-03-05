@@ -30,9 +30,8 @@ import logging
 import os
 import httpx
 import certifi
-from rich import print as pprint
 
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import AzureChatOpenAI
 
 
@@ -86,17 +85,54 @@ class LLM_cls:
 
     # ----------------------------------------------------------
     async def simple_query(self, query: str) -> str:
-        prompt = PromptTemplate(
-            input_variables=["query"],
-            template=""" 你是一位智能助理，請協助回答使用者問題，
-            請只要提供被```包含在內的資訊，不要提供額外資訊
-            以下為user的問題: {query} """)
+        """
+        Send *query* to the LLM and return the text reply.
+
+        Uses a ``ChatPromptTemplate`` with a strict **system** persona so the
+        model knows it is a date-parsing specialist, and a **human** slot that
+        carries the actual question.  This role-separation consistently
+        produces more focused, JSON-only replies even from smaller deployments.
+        """
+        prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                """\
+You are a precise date-parsing assistant specialised in interpreting freeform \
+date strings written by hardware design engineers in a project tracker.
+
+Your rules:
+1. Always respond with a single JSON object and **nothing else** — no prose, \
+no markdown fences, no explanation.
+2. The JSON must have exactly one key: "date" whose value is an ISO-8601 string \
+(YYYY-MM-DD), OR null if the intent cannot be determined at all.
+3. If the input is clearly "done", "v", "N/A", "x" or a similar completion \
+marker, set "date" to the string "done".
+4. When multiple dates appear (e.g. "3/2 -> 3/4" or "3/4(3/2)"), the \
+last / outermost value is the **current** ETA; use that one.
+5. If the year is ambiguous, assume the current or next calendar year so \
+that the resulting date is not more than 60 days in the past.
+
+Examples:
+  "Mar/4th"    -> {{"date": "2026-03-04"}}
+  "4 Mar"      -> {{"date": "2026-03-04"}}
+  "4/Mar"      -> {{"date": "2026-03-04"}}
+  "03.04"      -> {{"date": "2026-03-04"}}
+  "3/2 -> 3/4" -> {{"date": "2026-03-04"}}
+  "3/4(3/2)"   -> {{"date": "2026-03-04"}}
+  "done"       -> {{"date": "done"}}
+  "v"          -> {{"date": "done"}}
+  ""           -> {{"date": null}}\
+""",
+            ),
+            (
+                "human",
+                "Parse the following ETA field value and return the JSON result:\n{message}",
+            ),
+        ])
+
         chain    = prompt | self._llm
-        response = await chain.ainvoke({"query": query})
-        pprint(query)
-        pprint(prompt)
-        pprint(response)
-        reply = response.content          # LangChain BaseMessage uses .content (lowercase)
+        response = await chain.ainvoke({"message": query})
+        reply    = response.content   # BaseMessage uses .content (lowercase)
         logger.info(
             f"[LLM] simple_query reply: {reply[:120]!r}"
             f"{'...' if len(reply) > 120 else ''}"
