@@ -191,22 +191,32 @@ def _build_blank_eta_nudge_html(rec: SubsysRecord, field: str) -> str:
 # Field display order in all 2-D tables
 _FIELD_ORDER = ["ppt", "netlist", "sdc", "ccf", "upf"]
 
-# CSS column widths per deliverable in the 2-D tables
-_TH_STYLE  = "padding:5px 8px;border:1px solid #888;white-space:nowrap;"
-_TD_STYLE  = "padding:4px 6px;border:1px solid #888;"
-_HDR_STYLE = _TH_STYLE + "background:#333;color:#FFF;font-weight:bold;"
+# ── Teams-safe inline styles ─────────────────────────────────────────────────
+# Teams strips: padding, border (CSS), font-weight (CSS), font-size, margin.
+# Teams keeps:  background-color, color, text-align on <td>/<th>.
+# Use border="1" on <table> and <b>/<strong> tags for bold.
+_TH_STYLE  = "background-color:#333;color:#FFFFFF;"   # dark header cell
+_TD_STYLE  = ""                                        # plain cell (no stripped props)
+_HDR_STYLE = _TH_STYLE                                # alias kept for readability
 
 
-def _overdue_cell_color(days: int) -> tuple[str, str]:
+def _overdue_cell_color(days: int) -> tuple[str, str, bool]:
     """
-    Map days-overdue → (background_color, text_color) for the overdue table.
-    Gradient runs light-pink → dark-maroon; text flips to white above day 3.
+    Map days-overdue → (background_color, text_color, bold) using the
+    Microsoft Teams-confirmed colour palette observed in actual rendered messages.
+
+    Severity scale:
+      ≤ 1d  : no highlight         (inherit bg / black text)
+      ≤ 3d  : amber text warning   (inherit bg / #FDC030 amber text)
+      ≤ 7d  : teal bg / rust text  (#90D9DB / #CD5937)
+      ≤ 14d : yellow bg / crimson  (#FDD472 / #B6424C)
+      14d+  : rose bg  / crimson   (#DF9299 / #B6424C) + bold
     """
-    if days <= 1:  return "#FFCCCC", "#000000"
-    if days <= 3:  return "#FF9999", "#000000"
-    if days <= 7:  return "#FF4444", "#FFFFFF"
-    if days <= 14: return "#CC0000", "#FFFFFF"
-    return             "#800000", "#FFFFFF"
+    if days <= 1:  return "",        "",        False
+    if days <= 3:  return "",        "#FDC030", False
+    if days <= 7:  return "#90D9DB", "#CD5937", False
+    if days <= 14: return "#FDD472", "#B6424C", False
+    return                "#DF9299", "#B6424C", True
 
 
 def _build_overdue_batch_html(owner: str, subsys_map: dict) -> str:
@@ -215,61 +225,64 @@ def _build_overdue_batch_html(owner: str, subsys_map: dict) -> str:
 
     subsys_map : {subsys: {field: {"eta":str, "days_overdue":int, "delivered":bool}}}
 
-    - Delivered field  → green cell (✅)
-    - Overdue  field   → red gradient cell with ETA date (deeper red = more overdue)
+    - Delivered field → green cell (✅)
+    - Overdue  field  → colour-coded cell per Teams-confirmed palette
+    - Missing  field  → empty cell
     """
-    seen = {f for fd in subsys_map.values() for f in fd}
+    seen   = {f for fd in subsys_map.values() for f in fd}
     fields = [f for f in _FIELD_ORDER if f in seen]
     today_str = date.today().strftime("%Y-%m-%d")
 
+    # ── header row ───────────────────────────────────────────────
     col_hdrs = "".join(
-        f'<th style="{_HDR_STYLE}">{f.upper()}</th>' for f in fields
+        f'<th style="{_TH_STYLE}"><b>{f.upper()}</b></th>' for f in fields
     )
     header = (
-        f'<tr><td colspan="{len(fields)+1}" '
-        f'style="{_TH_STYLE}background:#111;color:#FFF;font-size:1.05em;">'
-        f'🔴 Overdue Deliverables — {today_str} &nbsp;|  Owner: <b>{owner}</b>'
+        f'<tr>'
+        f'<td colspan="{len(fields)+1}" style="background-color:#222222;color:#FFFFFF;">'
+        f'&#128308; Overdue Deliverables &#8212; {today_str} &nbsp;| '
+        f'Owner: <b>{owner}</b>'
         f'</td></tr>'
-        f'<tr><th style="{_HDR_STYLE}">Subsys</th>{col_hdrs}</tr>'
+        f'<tr><th style="{_TH_STYLE}"><b>Subsys</b></th>{col_hdrs}</tr>'
     )
 
+    # ── data rows ────────────────────────────────────────────────
     rows = ""
     for subsys, fd in subsys_map.items():
-        cells = "".join(
-            (
-                f'<td style="{_TD_STYLE}background:#22BB22;color:#FFF;'
-                f'text-align:center;">✅</td>'
-                if fd.get(f, {}).get("delivered")
-                else (
-                    "".join([
-                        f'<td style="{_TD_STYLE}'
-                        f'background:{_overdue_cell_color(fd[f]["days_overdue"])[0]};'
-                        f'color:{_overdue_cell_color(fd[f]["days_overdue"])[1]};'
-                        f'font-weight:bold;text-align:center;">'
-                        f'{fd[f]["eta"]}</td>'
-                    ]) if f in fd
-                    else f'<td style="{_TD_STYLE}"></td>'
-                )
-            )
-            for f in fields
-        )
-        rows += f'<tr><td style="{_TD_STYLE}font-weight:bold;">{subsys}</td>{cells}</tr>'
+        cells = ""
+        for f in fields:
+            if f not in fd:
+                cells += "<td></td>"
+            elif fd[f].get("delivered"):
+                cells += '<td style="background-color:#22BB22;color:#FFFFFF;text-align:center;">&#10003;</td>'
+            else:
+                bg, fg, bold = _overdue_cell_color(fd[f]["days_overdue"])
+                style = ""
+                if bg: style += f"background-color:{bg};"
+                if fg: style += f"color:{fg};"
+                style += "text-align:center;"
+                eta_text = fd[f]["eta"]
+                inner    = f"<b>{eta_text}</b>" if bold else eta_text
+                cells   += f'<td style="{style}">{inner}</td>'
 
+        rows += f'<tr><td><b>{subsys}</b></td>{cells}</tr>'
+
+    # ── legend ───────────────────────────────────────────────────
     guide = (
         "<p><i>Colour: "
-        "<span style='background:#FFCCCC;padding:1px 4px;'>1d</span> "
-        "<span style='background:#FF9999;padding:1px 4px;'>3d</span> "
-        "<span style='background:#FF4444;color:#FFF;padding:1px 4px;'>7d</span> "
-        "<span style='background:#CC0000;color:#FFF;padding:1px 4px;'>14d</span> "
-        "<span style='background:#800000;color:#FFF;padding:1px 4px;'>14d+</span> "
-        "overdue</i></p>"
+        "<span>1d</span> "
+        '<span style="color:#FDC030"><i>3d</i></span> '
+        '<span style="background-color:#90D9DB;color:#CD5937"> 7d </span> '
+        '<span style="background-color:#FDD472;color:#B6424C"> 14d </span> '
+        '<span style="background-color:#DF9299;color:#B6424C"><b>14d+</b></span>'
+        " overdue</i></p>"
     )
+
     return (
-        f'<table cellpadding="0" cellspacing="0" '
-        f'style="border-collapse:collapse;font-family:Arial,sans-serif;">'
-        f'<thead>{header}</thead>'
-        f'<tbody>{rows}</tbody>'
-        f'</table>{guide}'
+        f'<table border="1">'
+        f"<thead>{header}</thead>"
+        f"<tbody>{rows}</tbody>"
+        f"</table>{guide}"
     )
 
 
@@ -278,50 +291,49 @@ def _build_blank_eta_batch_html(owner: str, subsys_map: dict) -> str:
     2-D ETA-Required table:  rows=subsys, columns=deliverable fields.
 
     subsys_map : {subsys: {field: str}}
-      field value = ""           → blank   → yellow cell (ETA missing)
-      field value = "2026/3/2"   → has ETA → plain white cell  showing the date
-
-    Fields missing from a subsys dict are skipped (field not applicable).
+      field value = ""           → blank   → yellow cell (#FDD472) — ETA missing
+      field value = "2026/3/2"   → has ETA → plain cell showing the date
     """
-    seen = {f for fd in subsys_map.values() for f in fd}
+    seen   = {f for fd in subsys_map.values() for f in fd}
     fields = [f for f in _FIELD_ORDER if f in seen]
-    today_str = date.today().strftime("%Y-%m-%d")
 
+    # ── header row ───────────────────────────────────────────────
     col_hdrs = "".join(
-        f'<th style="{_TH_STYLE}">{f.upper()}</th>' for f in fields
+        f'<th style="{_TH_STYLE}"><b>{f.upper()}</b></th>' for f in fields
     )
     header = (
-        f'<tr><td colspan="{len(fields)+1}" '
-        f'style="{_TH_STYLE}font-weight:bold;">'
-        f'Owner: <b>{owner}</b>'
-        f'</td></tr>'
-        f'<tr><th style="{_TH_STYLE}">ETA required</th>{col_hdrs}</tr>'
+        f'<tr>'
+        f'<td colspan="{len(fields)+1}"><b>ETA Required &#8212; Owner: {owner}</b></td>'
+        f'</tr>'
+        f'<tr><th style="{_TH_STYLE}"><b>Subsys</b></th>{col_hdrs}</tr>'
     )
 
+    # ── data rows ────────────────────────────────────────────────
     rows = ""
     for subsys, fd in subsys_map.items():
-        cells = "".join(
-            (
-                f'<td style="{_TD_STYLE}background:#FFD700;"></td>'
-                if fd.get(f, None) == ""
-                else (
-                    f'<td style="{_TD_STYLE}">{fd[f]}</td>'
-                    if f in fd
-                    else f'<td style="{_TD_STYLE}"></td>'
-                )
-            )
-            for f in fields
-        )
-        rows += f'<tr><td style="{_TD_STYLE}font-weight:bold;">{subsys}</td>{cells}</tr>'
+        cells = ""
+        for f in fields:
+            if f not in fd:
+                cells += "<td></td>"
+            elif fd[f] == "":
+                # Blank → yellow warning cell (same Teams palette yellow as 14d)
+                cells += '<td style="background-color:#FDD472;color:#B6424C;text-align:center;">&#8212;</td>'
+            else:
+                cells += f"<td>{fd[f]}</td>"
+        rows += f'<tr><td><b>{subsys}</b></td>{cells}</tr>'
 
     return (
-        f'<table cellpadding="0" cellspacing="0" '
-        f'style="border-collapse:collapse;font-family:Arial,sans-serif;">'
-        f'<thead>{header}</thead>'
-        f'<tbody>{rows}</tbody>'
-        f'</table>'
-        f'<p><i>🟡 Yellow = ETA missing &nbsp; White = ETA already provided</i></p>'
+        f'<table border="1">'
+        f"<thead>{header}</thead>"
+        f"<tbody>{rows}</tbody>"
+        f"</table>"
+        f'<p><i>'
+        f'<span style="background-color:#FDD472;color:#B6424C"> &#8212; </span>'
+        f" = ETA missing &nbsp; plain = ETA already provided"
+        f"</i></p>"
     )
+
+
 
 
 # ─────────────────────────────────────────────────────────────
