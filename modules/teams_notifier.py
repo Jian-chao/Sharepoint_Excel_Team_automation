@@ -483,7 +483,14 @@ async def _get_eta_message_template(llm) -> str:
         "Output only the template text — nothing else."
     )
     try:
-        tmpl = await llm.simple_query(prompt)
+        tmpl = await llm.simple_query(
+            prompt,
+            system_prompt=(
+                "You are a helpful assistant that writes professional "
+                "but friendly internal communication messages. "
+                "Follow the instructions exactly and output only the requested text."
+            ),
+        )
         # Validate that all required placeholders are present; fall back otherwise.
         if all(p in tmpl for p in ("[OWNER]", "[ITEMS]", "[LINK_NOTE]")):
             return tmpl
