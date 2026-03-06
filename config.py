@@ -91,14 +91,25 @@ REMINDER_LEAD_DAYS   = int(os.environ.get("REMINDER_LEAD_DAYS", "1"))    # notif
 TIMEZONE             = os.environ.get("TZ", "Asia/Taipei")               # APScheduler timezone
 
 # ============================================================
-# Deliverable → owner mapping
+# Project deadline & deliverable ownership
 # ============================================================
-# Fields listed here are considered the responsibility of the Frontend Engineer (FE).
-# All other tracked fields (netlist, sdc, ccf, upf) default to the BE owner.
-# Modify this list to reassign ownership without touching module code.
+# Single source-of-truth for the project deliverable deadline.
+# Format: (YYYY, MM, DD) — change here to affect all modules.
+from datetime import date as _date
+PROJECT_DEADLINE: _date = _date(2026, 2, 26)
+
+# Backward-compat alias used inside the overdue tracker
+DEFAULT_ETA: _date = PROJECT_DEADLINE
+
+# Which fields are owned by the Frontend Engineer (FE).
+# All other tracked fields (netlist, sdc, ccf, upf) default to BE.
 FE_OWNED_FIELDS: list = ["ppt", "ppt_status"]
 
-# Default deadline used when a deliverable has no custom ETA in the Excel sheet.
-# Format: (YYYY, MM, DD)
-from datetime import date as _date
-DEFAULT_ETA: _date = _date(2026, 2, 26)
+# ============================================================
+# SharePoint Excel web link (shown in Teams ETA-request messages)
+# ============================================================
+# Set EXCEL_WEB_LINK env-var on the remote machine to the full
+# browser-accessible URL of the tracking Excel file.
+# No path segments are concatenated here — all components are
+# independently configurable via environment variables.
+EXCEL_WEB_LINK = os.environ.get("EXCEL_WEB_LINK", "")  # --- REPLACE ON REMOTE ---

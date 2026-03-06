@@ -72,100 +72,194 @@ def get_notifier():
 # Message formatting helpers (shared, synchronous)
 # ─────────────────────────────────────────────────────────────
 
-def _status_icon(val: str, splunk_val: Optional[bool] = None) -> str:
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-level cell helpers  (Teams-compatible, no Emoji)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_month_day(d: date) -> str:
+    """Format a date as 'Mar/4' (cross-platform, no leading zero)."""
+    return f"{d.strftime('%b')}/{d.day}"
+
+
+def _cell(bg: str, fg: str, content: str) -> str:
+    """Build a <td> with optional Teams-supported background/foreground colour."""
+    style = ""
+    if bg: style += f"background-color:{bg};"
+    if fg: style += f"color:{fg};"
+    return f'<td style="{style}">{content}</td>'
+
+
+def _upload_cell_attrs(val: str, splunk_val: Optional[bool] = None) -> tuple:
     """
-    Produce a human-readable status string.
-    Excel value: 'v' uploaded, 'x' not needed, '' not uploaded
-    Splunk value: True uploaded, False not, None no data
+    Return (bg, fg, text) for a Perforce upload field (netlist/sdc/ccf/upf).
+
+    Teams-confirmed colour palette:
+      Done    → green  #22BB22 / #FFFFFF
+      Missing → yellow #FDD472 / #B6424C
+      ETA     → amber text on inherit bg
+      N/A     → plain
     """
     if val and val.lower() == "x":
-        return "➖ N/A"
-    if val and val.lower() == "v":
-        return "✅ Done"
-    if splunk_val is True:
-        return "✅ Perforce"
+        return "", "", "N/A"
+    if (val and val.lower() == "v") or splunk_val is True:
+        return "#22BB22", "#FFFFFF", "&#10003; Done"
     if splunk_val is False:
-        return "❌ Missing"
-    if splunk_val is None:
-        return "❓ No Data"
-    return f"⏳ {val}" if val else "❌ Missing"
+        return "#FDD472", "#B6424C", "&#10007; Missing"
+    if splunk_val is None and not val:
+        return "", "", "?"
+    if val:
+        return "", "#FDC030", val   # ETA text written by DE
+    return "#FDD472", "#B6424C", "&#10007; Missing"
 
 
-def _ppt_icon(val: str, deadline: date) -> str:
+def _ppt_cell_attrs(
+    val: str,
+    deadline: date,
+    eta_date: Optional[date] = None,
+) -> tuple:
+    """
+    Return (bg, fg, text) for the PPT / ETA column.
+
+    Parameters
+    ----------
+    val      : raw Excel cell value
+    deadline : project deadline (from config.PROJECT_DEADLINE)
+    eta_date : LLM-parsed date from ETAResult.parsed (may be None)
+    """
     if not val:
         if date.today() > deadline:
-            return "🔴 OVERDUE"
-        return "❌ Missing"
-    if val.lower() == "done":
-        return "✅ Done"
-    if val.lower() == "n/a":
-        return "➖ N/A"
-    try:
-        eta = datetime.strptime(val.replace("eta:", "").strip(), "%Y-%m-%d").date()
-        days_left = (eta - date.today()).days
+            return "#DF9299", "#B6424C", "<b>[OVERDUE]</b>"
+        return "#FDD472", "#B6424C", "&#10007; Missing"
+
+    lo = val.lower().strip()
+    if lo in ("done", "v"):
+        return "#22BB22", "#FFFFFF", "&#10003; Done"
+    if lo in ("n/a", "x"):
+        return "", "", "N/A"
+
+    # If LLM gave us a parsed date, use it; otherwise try a quick ISO parse.
+    d = eta_date
+    if d is None:
+        try:
+            d = datetime.strptime(
+                val.replace("eta:", "").strip(), "%Y-%m-%d"
+            ).date()
+        except ValueError:
+            pass
+
+    if d is not None:
+        days_left = (d - date.today()).days
+        label = _format_month_day(d)
         if days_left < 0:
-            return f"🔴 OVERDUE (eta:{eta})"
+            return "#DF9299", "#B6424C", f"<b>[OD] {label}</b>"
         if days_left <= config.REMINDER_LEAD_DAYS:
-            return f"⚠️ DUE SOON ({eta})"
-        return f"⏳ ETA {eta}"
-    except ValueError:
-        return f"⏳ {val}"
+            return "#FDD472", "#B6424C", label
+        return "", "#FDC030", label
+
+    # Unparsed raw value — amber text, inherit bg
+    return "", "#FDC030", val
 
 
-def _build_summary_html(records: list[SubsysRecord], splunk_data: dict) -> str:
+# Legacy wrappers kept for backward-compat (tests, etc.)
+def _status_icon(val: str, splunk_val: Optional[bool] = None) -> str:
+    """Return text status for an upload field. Use _upload_cell_attrs for styled tables."""
+    _, _, text = _upload_cell_attrs(val, splunk_val)
+    return text
+
+
+def _ppt_icon(val: str, deadline: date, eta_date: Optional[date] = None) -> str:
+    """Return text status for the PPT field. Use _ppt_cell_attrs for styled tables."""
+    _, _, text = _ppt_cell_attrs(val, deadline, eta_date)
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML message builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_summary_html(
+    records: list,
+    splunk_data: dict,
+    eta_results_map: Optional[dict] = None,
+) -> str:
     """
-    Build an HTML table for posting to Teams via Graph API.
-    splunk_data: {subsys_name: {"netlist": bool|None, "sdc": bool|None, ...}}
+    Build a Teams-compatible HTML summary table.
+
+    Parameters
+    ----------
+    records         : list[SubsysRecord]
+    splunk_data     : {subsys: {"netlist": bool|None, ...}}
+    eta_results_map : {subsys: ETAResult} pre-computed by caller, or None.
+                      Used to display the LLM-parsed PPT date as 'Mar/4'.
+
+    Deadline is read from ``config.PROJECT_DEADLINE`` (configurable).
+    No Emoji — uses Teams-confirmed colour palette & HTML entities.
     """
-    deadline = date(2026, 2, 26)   # fallback — update from config or dynamic parse
+    deadline  = getattr(config, "PROJECT_DEADLINE", date(2026, 2, 26))
+    eta_map   = eta_results_map or {}
+    today_str = date.today().strftime("%Y-%m-%d")
 
     rows_html = ""
     for rec in records:
-        sp = splunk_data.get(rec.subsys, {})
-        rows_html += (
-            f"<tr>"
-            f"<td><b>{rec.subsys}</b></td>"
-            f"<td>{rec.fe}</td>"
-            f"<td>{rec.bc}</td>"
-            f"<td>{rec.be}</td>"
-            f"<td>{_ppt_icon(rec.ppt_status, deadline)}</td>"
-            f"<td>{_status_icon(rec.netlist, sp.get('netlist'))}</td>"
-            f"<td>{_status_icon(rec.sdc,     sp.get('sdc'))}</td>"
-            f"<td>{_status_icon(rec.ccf,     sp.get('ccf'))}</td>"
-            f"<td>{_status_icon(rec.upf,     sp.get('upf'))}</td>"
-            f"</tr>"
+        sp       = splunk_data.get(rec.subsys, {})
+        eta_res  = eta_map.get(rec.subsys)
+        eta_date = (
+            eta_res.parsed
+            if eta_res and not isinstance(eta_res, BaseException)
+            else None
         )
 
-    today_str = date.today().strftime("%Y-%m-%d")
-    html = f"""
-<h3>📋 FDI DEF Request — Daily Status Report ({today_str})</h3>
-<table border="1" cellpadding="4" cellspacing="0">
-  <thead>
-    <tr>
-      <th>Subsys</th><th>FE</th><th>BC</th><th>BE</th>
-      <th>PPT</th><th>Netlist</th><th>SDC</th><th>CCF</th><th>UPF</th>
-    </tr>
-  </thead>
-  <tbody>
-    {rows_html}
-  </tbody>
-</table>
-<p><i>Legend: ✅ Done | ❌ Missing | ⏳ ETA | 🔴 Overdue | ➖ N/A | ❓ No data uploaded</i></p>
-"""
-    return html.strip()
+        ppt_bg, ppt_fg, ppt_txt = _ppt_cell_attrs(rec.ppt_status, deadline, eta_date)
+        nl_bg,  nl_fg,  nl_txt  = _upload_cell_attrs(rec.netlist, sp.get("netlist"))
+        sd_bg,  sd_fg,  sd_txt  = _upload_cell_attrs(rec.sdc,     sp.get("sdc"))
+        cf_bg,  cf_fg,  cf_txt  = _upload_cell_attrs(rec.ccf,     sp.get("ccf"))
+        uf_bg,  uf_fg,  uf_txt  = _upload_cell_attrs(rec.upf,     sp.get("upf"))
+
+        rows_html += (
+            "<tr>"
+            + _cell("", "", f"<b>{rec.subsys}</b>")
+            + _cell("", "", rec.fe)
+            + _cell("", "", rec.bc)
+            + _cell("", "", rec.be)
+            + _cell(ppt_bg, ppt_fg, ppt_txt)
+            + _cell(nl_bg,  nl_fg,  nl_txt)
+            + _cell(sd_bg,  sd_fg,  sd_txt)
+            + _cell(cf_bg,  cf_fg,  cf_txt)
+            + _cell(uf_bg,  uf_fg,  uf_txt)
+            + "</tr>"
+        )
+
+    legend = (
+        '<span style="background-color:#22BB22;color:#FFFFFF">&#10003;</span> Done &nbsp; '
+        '<span style="color:#B6424C">&#10007;</span> Missing &nbsp; '
+        '<span style="color:#FDC030">Mar/D</span> = ETA &nbsp; '
+        '<span style="background-color:#DF9299;color:#B6424C">[OD]</span> Overdue &nbsp; '
+        "N/A = Not applicable"
+    )
+    return (
+        f"<p><b>FDI DEF Request &#8212; Daily Status ({today_str})</b></p>"
+        f'<table border="1">'
+        f"<thead><tr>"
+        f"<th>Subsys</th><th>FE</th><th>BC</th><th>BE</th>"
+        f"<th>PPT</th><th>Netlist</th><th>SDC</th><th>CCF</th><th>UPF</th>"
+        f"</tr></thead>"
+        f"<tbody>{rows_html}</tbody>"
+        f"</table>"
+        f"<p><i>{legend}</i></p>"
+    )
 
 
 def _build_reminder_html(rec: SubsysRecord, field: str, eta: str) -> str:
     return (
-        f"<p>⚠️ <b>Reminder:</b> The <b>{field}</b> deliverable for subsys "
+        f"<p><b>Reminder:</b> The <b>{field}</b> deliverable for subsystem "
         f"<b>{rec.subsys}</b> is due <b>tomorrow ({eta})</b>.<br>"
-        f"Owner: {rec.be} / FE: {rec.fe} — please ensure upload is complete.</p>"
+        f"Owner: {rec.be} / FE: {rec.fe} &#8212; please ensure upload is complete.</p>"
     )
 
 
 def _build_overdue_html(rec: SubsysRecord, field: str) -> str:
     return (
-        f"<p>🔴 <b>OVERDUE:</b> <b>{field}</b> for subsys <b>{rec.subsys}</b> "
+        f"<p><b>OVERDUE:</b> <b>{field}</b> for subsys <b>{rec.subsys}</b> "
         f"has passed its deadline!<br>"
         f"Owner: {rec.be} / FE: {rec.fe} / BC: {rec.bc}<br>"
         f"Please provide an updated ETA immediately.</p>"
@@ -173,19 +267,21 @@ def _build_overdue_html(rec: SubsysRecord, field: str) -> str:
 
 
 def _build_blank_eta_nudge_html(rec: SubsysRecord, field: str) -> str:
-    """
-    Message sent to the owner when their ETA / upload field is blank.
-    Politely asks them to fill in an expected upload date.
-    """
+    """Single-field nudge kept for backward-compat. Prefer _gen_blank_eta_message."""
     owner      = rec.be or rec.fe or "team"
     field_name = field.replace("_status", "").upper()
-    return (
-        f"<p>📅 <b>ETA Request:</b> The <b>{field_name}</b> upload field for "
-        f"subsys <b>{rec.subsys}</b> is currently blank.<br>"
-        f"Hi <b>{owner}</b>, please reply with your expected upload date "
-        f"so we can keep the tracker up to date. 🙏<br>"
-        f"(FE: {rec.fe} | BC: {rec.bc})</p>"
+    excel_link = getattr(config, "EXCEL_WEB_LINK", "")
+    link_html  = (
+        f' &#8212; <a href="{excel_link}">update here</a>' if excel_link else ""
     )
+    return (
+        f"<p><b>ETA Request:</b> The <b>{field_name}</b> field for "
+        f"<b>{rec.subsys}</b> is currently blank.<br>"
+        f"Hi <b>{owner}</b>, please provide your expected upload date{link_html}.<br>"
+        f"(FE: {rec.fe} | BC: {rec.bc})<br>"
+        f"<i>(Automated &#8212; do not reply here, update the Excel file directly.)</i></p>"
+    )
+
 
 
 # Field display order in all 2-D tables
@@ -225,10 +321,21 @@ def _build_overdue_batch_html(owner: str, subsys_map: dict) -> str:
 
     subsys_map : {subsys: {field: {"eta":str, "days_overdue":int, "delivered":bool}}}
 
-    - Delivered field → green cell (✅)
-    - Overdue  field  → colour-coded cell per Teams-confirmed palette
-    - Missing  field  → empty cell
+    - Delivered field -> green cell  (&#10003;)
+    - Overdue  field  -> colour-coded cell per Teams-confirmed palette
+    - Missing  field  -> empty cell
+
+    Returns empty string "" when every field in every subsystem is delivered,
+    so callers can skip posting entirely.
     """
+    # Skip post entirely if nothing is overdue
+    if all(
+        info.get("delivered")
+        for fd in subsys_map.values()
+        for info in fd.values()
+    ):
+        return ""
+
     seen   = {f for fd in subsys_map.values() for f in fd}
     fields = [f for f in _FIELD_ORDER if f in seen]
     today_str = date.today().strftime("%Y-%m-%d")
@@ -336,6 +443,98 @@ def _build_blank_eta_batch_html(owner: str, subsys_map: dict) -> str:
 
 
 
+_FALLBACK_TEMPLATE = (
+    "Hi [OWNER], the following deliverables are missing ETAs in the tracker. "
+    "Could you please fill in your expected upload dates?\n\n"
+    "[ITEMS]\n\n"
+    "Please update the Excel file directly[LINK_NOTE] — "
+    "do not reply to this automated message. Thank you!"
+)
+
+
+async def _get_eta_message_template(llm) -> str:
+    """
+    Query the LLM **once** to produce a reusable message template.
+
+    The template must contain these literal placeholders:
+      [OWNER]     — recipient's name
+      [ITEMS]     — list of missing deliverables ("subsys: f1, f2" per line)
+      [LINK_NOTE] — replaced with " at <link>" or "" if no link configured
+
+    Returns the raw template string (plain text, not HTML).
+    Falls back to ``_FALLBACK_TEMPLATE`` if LLM is None or fails.
+    """
+    if llm is None:
+        return _FALLBACK_TEMPLATE
+
+    prompt = (
+        "Write a short, professional ETA-request message template for a "
+        "hardware project tracker. The message will be sent to different engineers "
+        "each time, so it uses these exact placeholders (keep them verbatim):\n\n"
+        "  [OWNER]     — replaced with the recipient's name\n"
+        "  [ITEMS]     — replaced with the list of missing deliverables\n"
+        "  [LINK_NOTE] — replaced with ' at <Excel URL>' or empty string\n\n"
+        "Requirements:\n"
+        "- just use Hi [OWNER] and directly ask them to fill in the missing ETAs\n"
+        "- Mention the items from [ITEMS] clearly\n"
+        "- Instruct them to update the Excel file[LINK_NOTE] and NOT reply to this "
+        "automated message\n"
+        "- Plain text only, no emoji, no markdown, no HTML tags\n"
+        "Output only the template text — nothing else."
+    )
+    try:
+        tmpl = await llm.simple_query(prompt)
+        # Validate that all required placeholders are present; fall back otherwise.
+        if all(p in tmpl for p in ("[OWNER]", "[ITEMS]", "[LINK_NOTE]")):
+            return tmpl
+        logger.warning("[Teams] LLM template missing placeholders, using fallback.")
+        return _FALLBACK_TEMPLATE
+    except Exception as exc:
+        logger.warning(f"[Teams] LLM template gen failed ({exc}), using fallback.")
+        return _FALLBACK_TEMPLATE
+
+
+def _render_eta_message(
+    template: str,
+    owner: str,
+    subsys_map: dict,
+    excel_link: str,
+) -> str:
+    """
+    Fill *template* with owner-specific data and return an HTML paragraph.
+
+    Sync (no LLM call).  Returns "" when nothing in *subsys_map* is blank.
+    """
+    lines = []
+    for subsys, fd in subsys_map.items():
+        missing = [f.replace("_status", "") for f, v in fd.items() if v == ""]
+        if missing:
+            lines.append(f"{subsys}: {', '.join(missing)}")
+
+    if not lines:
+        return ""
+
+    link_note = f" at {excel_link}" if excel_link else ""
+    items_str = "\n".join(lines)
+
+    text = (
+        template
+        .replace("[OWNER]",     owner)
+        .replace("[ITEMS]",     items_str)
+        .replace("[LINK_NOTE]", link_note)
+    )
+
+    # Escape HTML, convert newlines, append clickable link
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("\n\n", "</p><p>").replace("\n", "<br>")
+    if excel_link:
+        text += (
+            f'<br>&#8594; <a href="{excel_link}">Open Excel tracker</a>'
+        )
+    return f"<p>{text}</p>"
+
+
+
 # ─────────────────────────────────────────────────────────────
 # MOCK notifier  (all methods are async for interface parity)
 # ─────────────────────────────────────────────────────────────
@@ -348,6 +547,9 @@ class MockTeamsNotifier:
     ``await`` them whether Mock or Remote is in use.
     """
 
+    def __init__(self, llm=None):
+        self._llm = llm
+
     async def post_to_chat(self, html_body: str, chat_id: str = "MOCK"):
         print(f"\n{'='*60}")
         print(f"[MockTeams] → Chat: {chat_id}")
@@ -355,9 +557,12 @@ class MockTeamsNotifier:
         print(f"{'='*60}\n")
 
     async def post_daily_summary(
-        self, records: list[SubsysRecord], splunk_data: dict
+        self,
+        records: list,
+        splunk_data: dict,
+        eta_results_map: Optional[dict] = None,
     ):
-        html = _build_summary_html(records, splunk_data)
+        html = _build_summary_html(records, splunk_data, eta_results_map)
         await self.post_to_chat(html)
 
     async def send_eta_reminder(self, rec: SubsysRecord, field: str, eta: str):
@@ -365,12 +570,12 @@ class MockTeamsNotifier:
         await self.post_to_chat(html)
 
     async def send_overdue_alert(self, rec: SubsysRecord, field: str):
-        """Send a single overdue alert (kept for backward-compat; prefer send_overdue_batch)."""
+        """Single overdue alert (kept for backward-compat; prefer send_overdue_batch)."""
         html = _build_overdue_html(rec, field)
         await self.post_to_chat(html)
 
     async def send_blank_eta_nudge(self, rec: SubsysRecord, field: str):
-        """Nudge the owner to fill in their ETA (kept for backward-compat; prefer send_blank_eta_batch)."""
+        """Single ETA nudge (kept for backward-compat; prefer send_blank_eta_batch)."""
         html = _build_blank_eta_nudge_html(rec, field)
         await self.post_to_chat(html)
 
@@ -379,26 +584,24 @@ class MockTeamsNotifier:
         grouped: dict,
         chat_id: str = "MOCK",
     ):
-        """
-        Send one mock message per owner covering all their overdue items.
-        grouped : {owner: [{"subsys", "field", "fe", "bc"}, ...]}
-        """
-        for owner, items in grouped.items():
-            html = _build_overdue_batch_html(owner, items)
-            await self.post_to_chat(html, chat_id)
+        """One message per owner. Skips if all fields are already delivered."""
+        for owner, subsys_map in grouped.items():
+            html = _build_overdue_batch_html(owner, subsys_map)
+            if html:   # empty string means all delivered — skip
+                await self.post_to_chat(html, chat_id)
 
     async def send_blank_eta_batch(
         self,
         grouped: dict,
         chat_id: str = "MOCK",
     ):
-        """
-        Send one mock message per owner listing all their blank ETA fields.
-        grouped : {owner: [{"subsys", "field", "fe", "bc"}, ...]}
-        """
-        for owner, items in grouped.items():
-            html = _build_blank_eta_batch_html(owner, items)
-            await self.post_to_chat(html, chat_id)
+        """One LLM template (1 call) then sync render per owner."""
+        excel_link = getattr(config, "EXCEL_WEB_LINK", "")
+        template   = await _get_eta_message_template(self._llm)
+        for owner, subsys_map in grouped.items():
+            msg = _render_eta_message(template, owner, subsys_map, excel_link)
+            if msg:
+                await self.post_to_chat(msg, chat_id)
 
     async def poll_chat_messages(
         self,
@@ -548,7 +751,7 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
         pip install msgraph-sdk kiota-authentication-azure azure-core msal
     """
 
-    def __init__(self):                                        # --- REMOTE ONLY ---
+    def __init__(self, llm=None):                                # --- REMOTE ONLY ---
         try:
             from msgraph import GraphServiceClient             # --- REMOTE ONLY ---
             # from kiota_authentication_azure.azure_identity_authentication_provider import (
@@ -570,6 +773,7 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
             scopes      = config.TEAMS_SCOPES,
         )
         self._default_chat   = config.TEAMS_CHAT_ID
+        self._llm            = llm   # for _gen_blank_eta_message
 
         # Rate-limiter state — Graph API enforces 10 messages / 10 seconds.
         # Sleeping at least _min_interval seconds between posts keeps us safely
@@ -637,11 +841,12 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
     # ----------------------------------------------------------
     async def post_daily_summary(                              # --- REMOTE ONLY ---
         self,
-        records:     list[SubsysRecord],
-        splunk_data: dict,
-        chat_id:     Optional[str] = None,
+        records:         list,
+        splunk_data:     dict,
+        eta_results_map: Optional[dict] = None,
+        chat_id:         Optional[str]  = None,
     ):
-        html = _build_summary_html(records, splunk_data)
+        html = _build_summary_html(records, splunk_data, eta_results_map)
         return await self.post_to_chat(html, chat_id)
 
     async def send_eta_reminder(                               # --- REMOTE ONLY ---
@@ -679,38 +884,26 @@ class RemoteTeamsNotifier:                                     # --- REMOTE ONLY
         grouped:  dict,
         chat_id:  Optional[str] = None,
     ):
-        """
-        Send **one** Teams message per owner with a table of all their overdue items.
-        The built-in rate-limiter in :meth:`post_to_chat` ensures we stay
-        below the 10/10s Graph API quota automatically.
-
-        grouped : {owner_name: [{"subsys", "field", "fe", "bc"}, ...]}
-        """
-        for owner, items in grouped.items():
-            html = _build_overdue_batch_html(owner, items)
-            await self.post_to_chat(html, chat_id)
-            logger.info(
-                f"[Teams] Overdue batch → {owner!r} ({len(items)} item(s))."
-            )
+        """One Teams message per owner. Skips if all fields are delivered."""
+        for owner, subsys_map in grouped.items():
+            html = _build_overdue_batch_html(owner, subsys_map)
+            if html:   # empty string = all delivered — skip post
+                await self.post_to_chat(html, chat_id)
+                logger.info(f"[Teams] Overdue batch → {owner!r}.")
 
     async def send_blank_eta_batch(                            # --- REMOTE ONLY ---
         self,
         grouped:  dict,
         chat_id:  Optional[str] = None,
     ):
-        """
-        Send **one** Teams message per owner listing all their blank ETA fields.
-        The built-in rate-limiter in :meth:`post_to_chat` ensures we stay
-        below the 10/10s Graph API quota automatically.
-
-        grouped : {owner_name: [{"subsys", "field", "fe", "bc"}, ...]}
-        """
-        for owner, items in grouped.items():
-            html = _build_blank_eta_batch_html(owner, items)
-            await self.post_to_chat(html, chat_id)
-            logger.info(
-                f"[Teams] Blank-ETA batch → {owner!r} ({len(items)} field(s))."
-            )
+        """One LLM template (1 call) then sync render per owner."""
+        excel_link = getattr(config, "EXCEL_WEB_LINK", "")
+        template   = await _get_eta_message_template(self._llm)
+        for owner, subsys_map in grouped.items():
+            msg = _render_eta_message(template, owner, subsys_map, excel_link)
+            if msg:
+                await self.post_to_chat(msg, chat_id)
+                logger.info(f"[Teams] ETA-request → {owner!r}.")
 
     # ----------------------------------------------------------
     async def poll_chat_messages(                              # --- REMOTE ONLY ---

@@ -36,8 +36,8 @@ from modules.teams_notifier   import MockTeamsNotifier
 
 logger = logging.getLogger(__name__)
 
-# Deadline date (parsed lazily from config / Excel cell)
-_DEADLINE = date(2026, 2, 26)   # update dynamically if needed
+# Deadline: read from config so it's configurable without touching module code.
+_DEADLINE = getattr(config, "PROJECT_DEADLINE", date(2026, 2, 26))
 
 
 def _parse_time(time_str: str):
@@ -75,6 +75,11 @@ class AutomationScheduler:
 
         # ETAChecker is created once; it holds the LLM reference
         self.eta_checker = ETAChecker(llm=llm, notifier=notifier)
+
+        # Propagate LLM reference to the notifier so it can generate
+        # LLM-varied ETA-request messages in send_blank_eta_batch.
+        if llm is not None and not getattr(notifier, "_llm", None):
+            notifier._llm = llm
 
         # Persistent event loop used exclusively by run_now().
         # asyncio.run() creates+destroys a new loop each call, which
@@ -182,7 +187,19 @@ class AutomationScheduler:
         logger.info("[Scheduler] ▶ Running: daily_summary")
         try:
             records, splunk_data = self._fetch_data()
-            await self.notifier.post_daily_summary(records, splunk_data)
+
+            # Pre-compute PPT ETA for all records concurrently so the
+            # summary table can display 'Mar/4' instead of raw strings.
+            raw_eta = await asyncio.gather(
+                *[self.eta_checker.parse_eta(rec.ppt_status) for rec in records],
+                return_exceptions=True,
+            )
+            eta_results_map = {
+                rec.subsys: (res if not isinstance(res, BaseException) else None)
+                for rec, res in zip(records, raw_eta)
+            }
+
+            await self.notifier.post_daily_summary(records, splunk_data, eta_results_map)
             logger.info("[Scheduler] ✅ daily_summary done.")
         except Exception as exc:
             logger.error(f"[Scheduler] ❌ daily_summary failed: {exc}", exc_info=True)
